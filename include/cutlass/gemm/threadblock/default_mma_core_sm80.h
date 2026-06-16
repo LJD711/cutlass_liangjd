@@ -1392,23 +1392,23 @@ struct DefaultMmaCore<Shape_, WarpShape_, InstructionShape_, ElementA_,
                       layout::RowMajor, ElementB_, layout::ColumnMajor,
                       ElementC_, LayoutC_, arch::OpClassTensorOp, Stages,
                       Operator_, false, CacheOpA, CacheOpB> {
-  using Shape = Shape_;
-  using WarpShape = WarpShape_;
-  using InstructionShape = InstructionShape_;
-  using ElementA = ElementA_;
+  using Shape = Shape_; //128, 128, 64
+  using WarpShape = WarpShape_;//64, 64, 64
+  using InstructionShape = InstructionShape_; //16, 8, 16
+  using ElementA = ElementA_; // cutlass::half_t;
   using LayoutA = layout::RowMajor;
   using ElementB = ElementB_;
   using LayoutB = layout::ColumnMajor;
   using ElementC = ElementC_;
   using LayoutC = LayoutC_;
-  static int const kStages = Stages;
+  static int const kStages = Stages;// 3
   static cutlass::arch::CacheOperation::Kind const kCacheOpA = CacheOpA;
   static cutlass::arch::CacheOperation::Kind const kCacheOpB = CacheOpB;
 
   /// Number of warps present
   using WarpCount = GemmShape<Shape::kM / WarpShape::kM,
                               Shape::kN / WarpShape::kN, 
-                              Shape::kK / WarpShape::kK>;
+                              Shape::kK / WarpShape::kK>;// 2, 2, 1
 
   // Divisility requirements
   static_assert(
@@ -1416,10 +1416,10 @@ struct DefaultMmaCore<Shape_, WarpShape_, InstructionShape_, ElementA_,
       "Threadblock-scoped GEMM should be divisible by warp-scoped GEMM size.");
 
   /// Number of threads per warp
-  static int const kWarpSize = warp::WarpSize<arch::OpClassTensorOp>::value;
+  static int const kWarpSize = warp::WarpSize<arch::OpClassTensorOp>::value;//32
 
   /// Number of threads total
-  static int const kThreads = WarpCount::kCount * kWarpSize;
+  static int const kThreads = WarpCount::kCount * kWarpSize;//128
 
   /// Size of a threadblock-scoped access
   static int const kAccessSizeInBits = 128;
@@ -1429,16 +1429,16 @@ struct DefaultMmaCore<Shape_, WarpShape_, InstructionShape_, ElementA_,
 
   // Warp thread arrangement
   static int const kWarpThreadArrangementContiguousA =
-      Shape::kK / (kAccessSizeInBits / sizeof_bits<ElementA>::value);
+      Shape::kK / (kAccessSizeInBits / sizeof_bits<ElementA>::value);//64/(128/16) = 8 需要8线程读完一行
 
   static int const kWarpThreadArrangementStridedA =
-      kWarpSize / kWarpThreadArrangementContiguousA;
+      kWarpSize / kWarpThreadArrangementContiguousA; // 32/8 = 4 一个warp读一行
 
   static int const kWarpThreadArrangementContiguousB =
-      Shape::kK / (kAccessSizeInBits / sizeof_bits<ElementB>::value);
+      Shape::kK / (kAccessSizeInBits / sizeof_bits<ElementB>::value);//64/(128/16) = 8
 
   static int const kWarpThreadArrangementStridedB =
-      kWarpSize / kWarpThreadArrangementContiguousB;
+      kWarpSize / kWarpThreadArrangementContiguousB;//32/8 = 4
 
   //
   // Shared memory layouts

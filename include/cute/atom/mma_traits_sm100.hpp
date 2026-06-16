@@ -2027,6 +2027,8 @@ struct MMA_Traits<SM100_MMA_TF32_2x1SM_SS<a_type, b_type, c_type,
   }
 };
 
+// Blackwell tcgen05 的 2-SM F16/BF16 SS UMMA atom：SS 表示 A/B 都来自
+// SMEM descriptor，2x1SM 对应底层 tcgen05.mma.cta_group::2.kind::f16。
 template <class a_type, class b_type, class c_type,
           int M, int N,
           UMMA::Major a_major, UMMA::Major b_major,
@@ -2035,34 +2037,57 @@ struct MMA_Traits<SM100_MMA_F16BF16_2x1SM_SS<a_type, b_type, c_type,
                                      M, N, a_major, b_major,
                                      a_neg, b_neg>>
 {
+  // MMA atom 暴露给上层的逻辑元素类型：D/C 是累加器类型，A/B 是源操作数类型。
   using ValTypeD = c_type;
   using ValTypeA = a_type;
   using ValTypeB = b_type;
   using ValTypeC = c_type;
+
+  // F16BF16 路径要求 A/B 都是 16 bit 源类型，具体是 F16 还是 BF16 由 a_type/b_type
+  // 编码到后面的 UMMA::InstrDescriptor。底层 arch op 还会限制 M 为 128 或 256，
+  // N 为 [16, 256] 内的 16 的倍数。
   static_assert(cute::sizeof_bits_v<a_type> == cute::sizeof_bits_v<b_type> && cute::sizeof_bits_v<b_type> == 16, "SM100_MMA_F16BF16_2x1SM_SS supports 16bit types");
 
+  // SS 的两个 S 表示 A 和 B 都从 SMEM 读取。CuTe 传给 mma_unpack 的 A/B
+  // fragment 实际是寄存器里保存的 64-bit UMMA SMEM descriptor；a_major/b_major
+  // 指定 make_umma_desc 按 K-major 还是 MN-major 解释对应的 SMEM layout。
   using FrgTypeA = UMMA::smem_desc<a_major>;
   using FrgTypeB = UMMA::smem_desc<b_major>;
+
+  // C/D 累加器驻留在 TMEM，并使用 cta_group::2 对应的 2-SM TMEM 分配规则。
   using FrgTypeC = UMMA::tmem_frg_2sm<c_type>;
 
-  // Size of instructions's K extent is always 256bits, convert to units of element
+  // 硬件固定一条 tcgen05.mma 的 K 操作数宽度为 256 bit；换算成元素数就是
+  // K = 256 / sizeof_bits<a_type>。对 half_t/bfloat16_t 来说 K 为 16。
   constexpr static int K = 256 / cute::sizeof_bits<ValTypeA>::value;
 
+  // 一条指令实例计算的逻辑 MxNxK tile 形状。
   using Shape_MNK = Shape<Int<M>,Int<N>,Int<K>>;
+
+  // 2x1SM atom 有两个逻辑 CTA/SM rank 共同参与。
   using ThrID   = Layout<_2>;
+
+  // 下面三个 Layout 是 CuTe MMA atom 的 TV 布局，不是全局内存布局：
+  //   (logical CTA/SM rank, logical value id) -> flat MMA coordinate。
+  // A：rank 0/1 分别映射到 A 的两个 M/2 行切片，内部按 (m,k) 展平。
   using ALayout = Layout<Shape <      _2,Shape <Int<M/2>,Int<K>>>,
                          Stride<Int<M/2>,Stride<      _1,Int<M>>>>;
+  // B：rank 0/1 分别映射到 B 的两个 N/2 列切片，内部按 (n,k) 展平。
   using BLayout = Layout<Shape <      _2,Shape <Int<N/2>,Int<K>>>,
                          Stride<Int<N/2>,Stride<      _1,Int<N>>>>;
+  // C：rank 0/1 分别映射到累加器的两个 M/2 行切片，内部按 (m,n) 展平。
   using CLayout = Layout<Shape <      _2,Shape <Int<M/2>,Int<N>>>,
                          Stride<Int<M/2>,Stride<      _1,Int<M>>>>;
 
+  // 静态指令描述符：记录 A/B/C 格式、M/N 编码、A/B major mode 以及可选的
+  // A/B negate 位。mma_unpack 会把它放到运行时 idescE 的高 32 bit。
   UMMA::InstrDescriptor idesc_ = UMMA::make_instr_desc<
     a_type, b_type, c_type, M, N, a_major, b_major, a_neg, b_neg>();
 
-  // Accumulate or overwrite C.   1: read C, 0: ignore C [clear accumulators]
+  // ScaleOut 控制是否读取旧的 TMEM C：One 表示累加到旧值，Zero 表示忽略旧值并清零开始。
   UMMA::ScaleOut accumulate_ = UMMA::ScaleOut::One;
 
+  // 把 CuTe 通用 MMA_Atom::call 适配到底层 UMMA 指令的实参约定。
   template <class TD, class DLayout,
             class TA, class ALayout,
             class TB, class BLayout,
@@ -2075,16 +2100,22 @@ struct MMA_Traits<SM100_MMA_F16BF16_2x1SM_SS<a_type, b_type, c_type,
              Tensor<TB, BLayout> const& B,
              Tensor<TC, CLayout> const& C)
   {
+    // D/C 必须是 TMEM tensor；SS 路径下 A/B 是寄存器里保存的 SMEM descriptor。
     static_assert(is_tmem<TD>::value, "Expected tmem in MMA_Atom::call");
     static_assert(is_rmem<TA>::value, "Expected desc registers in MMA_Atom::call");
     static_assert(is_rmem<TB>::value, "Expected desc registers in MMA_Atom::call");
     static_assert(is_tmem<TC>::value, "Expected tmem in MMA_Atom::call");
 
+    // A/B tensor 的第 0 个寄存器就是 64-bit SMEM descriptor。
     uint64_t desc_a = A[0];
     uint64_t desc_b = B[0];
+    // D.data() 给出 TMEM 目的地址，也就是硬件指令的 [%0]。
     uint32_t tmem_c = raw_pointer_cast(D.data());
+    // 把静态 idesc_ 转成硬件需要的运行时 idescE 形式。
     uint64_t idesc = UMMA::make_runtime_instr_desc<>(traits.idesc_);
 
+    // 最终调用 arch wrapper；其中会 elect 一个线程发出
+    // tcgen05.mma.cta_group::2.kind::f16，并把 accumulate_ 作为 ScaleOut predicate。
     SM100_MMA_F16BF16_2x1SM_SS<a_type, b_type, c_type,
                        M, N,
                        a_major, b_major,

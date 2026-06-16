@@ -53,7 +53,7 @@ template<typename ImplicitGemmKernel_>
 class ImplicitGemmConvolution {
 public:
 
-  using UnderlyingKernel = GetUnderlyingKernel_t<ImplicitGemmKernel_>;
+  using UnderlyingKernel = GetUnderlyingKernel_t<ImplicitGemmKernel_>;//UnderlyingKernel 本质上就是 ImplicitGemmKernel_ = Conv2dFpropKernel
 
   using ElementA = typename UnderlyingKernel::ElementA;
   using LayoutA = typename UnderlyingKernel::LayoutA;

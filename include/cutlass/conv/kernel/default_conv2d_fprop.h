@@ -296,7 +296,7 @@ struct DefaultConv2dFprop <
 
   // Define the Mma
   using Mma = threadblock::ImplicitGemmMultistage<
-    ThreadblockShape,
+    ThreadblockShape,//GemmShape<128, 128, 64>
     IteratorA,
     SmemIteratorA,
     arch::CacheOperation::Always,
@@ -304,7 +304,7 @@ struct DefaultConv2dFprop <
     SmemIteratorB,
     CacheOpB,
     MmaPolicy,
-    Stages
+    Stages//3
   >;
 
   static const int kPartitionsK = ThreadblockShape::kK / WarpShape::kK;
