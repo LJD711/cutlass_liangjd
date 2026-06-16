@@ -1391,7 +1391,7 @@ template <
 struct DefaultMmaCore<Shape_, WarpShape_, InstructionShape_, ElementA_,
                       layout::RowMajor, ElementB_, layout::ColumnMajor,
                       ElementC_, LayoutC_, arch::OpClassTensorOp, Stages,
-                      Operator_, false, CacheOpA, CacheOpB> {
+                      Operator_, false, CacheOpA, CacheOpB> {//liangjd
   using Shape = Shape_; //128, 128, 64
   using WarpShape = WarpShape_;//64, 64, 64
   using InstructionShape = InstructionShape_; //16, 8, 16
@@ -1432,20 +1432,20 @@ struct DefaultMmaCore<Shape_, WarpShape_, InstructionShape_, ElementA_,
       Shape::kK / (kAccessSizeInBits / sizeof_bits<ElementA>::value);//64/(128/16) = 8 需要8线程读完一行
 
   static int const kWarpThreadArrangementStridedA =
-      kWarpSize / kWarpThreadArrangementContiguousA; // 32/8 = 4 一个warp读一行
+      kWarpSize / kWarpThreadArrangementContiguousA; // 32/8 = 4 一个warp读4行
 
   static int const kWarpThreadArrangementContiguousB =
       Shape::kK / (kAccessSizeInBits / sizeof_bits<ElementB>::value);//64/(128/16) = 8
 
   static int const kWarpThreadArrangementStridedB =
-      kWarpSize / kWarpThreadArrangementContiguousB;//32/8 = 4
+      kWarpSize / kWarpThreadArrangementContiguousB;//32/8 = 4 一个warp读4行
 
   //
   // Shared memory layouts
   //
 
   using SmemLayoutA = layout::RowMajorTensorOpMultiplicandCrosswise<
-      sizeof_bits<ElementA>::value, Shape::kK>;
+      sizeof_bits<ElementA>::value, Shape::kK>;//16 64
 
   // Shared memory layout
   using SmemLayoutB = layout::ColumnMajorTensorOpMultiplicandCrosswise<
@@ -1457,10 +1457,10 @@ struct DefaultMmaCore<Shape_, WarpShape_, InstructionShape_, ElementA_,
 
   /// ThreadMap of iterator A
   using IteratorThreadMapA = transform::PitchLinearWarpRakedThreadMap<
-      layout::PitchLinearShape<Shape::kK, Shape::kM>, kThreads,
-      layout::PitchLinearShape<kWarpThreadArrangementContiguousA,
-                               kWarpThreadArrangementStridedA>,
-      kAccessSizeInBits / sizeof_bits<ElementA>::value>;
+      layout::PitchLinearShape<Shape::kK, Shape::kM>, kThreads,//64 128
+      layout::PitchLinearShape<kWarpThreadArrangementContiguousA,//8
+                               kWarpThreadArrangementStridedA>, //4
+      kAccessSizeInBits / sizeof_bits<ElementA>::value>;//8个元素
 
   /// Shared memory iterator to A operand
   using SmemIteratorA = transform::threadblock::RegularTileAccessIterator<

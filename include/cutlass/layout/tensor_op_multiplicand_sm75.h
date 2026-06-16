@@ -77,17 +77,17 @@ struct TensorOpMultiplicand {
   /// This layout is optimized for 128b accesses
   static int const kAccessSize = 128;
 
-  static int const kElementSize = ElementSize;
-  static int const kElementsPerAccess = kAccessSize / kElementSize;
-  static int const kCrosswise = Crosswise;
+  static int const kElementSize = ElementSize;//16
+  static int const kElementsPerAccess = kAccessSize / kElementSize;//128/16 = 8 8个单元
+  static int const kCrosswise = Crosswise;//64
 
   /// Contiguous dimension of the tile shape matches one shared memory cache
   /// line - 128B.  For 128bit access size, it equals to 8 accesses.
-  static int const kTileShapeContiguous = 128 / (kAccessSize / 8);
+  static int const kTileShapeContiguous = 128 / (kAccessSize / 8);//8个新元素    kAccessSize / 8 表示一个新元素占多少字节
 
   /// Number of kblocks to store PartitionShape::kContiguous Elements
   static int const kFactor =
-      kTileShapeContiguous * kElementsPerAccess / kCrosswise;
+      kTileShapeContiguous * kElementsPerAccess / kCrosswise;//8*8/64 = 1
 
   static_assert(
       (kFactor > 0),
@@ -148,13 +148,13 @@ struct TensorOpMultiplicand {
   /// Returns the offset of a coordinate in linear memory.
   /// Assumes coordinate has convention (contiguous, strided)
   CUTLASS_HOST_DEVICE
-  LongIndex operator()(TensorCoord const &coord) const {
+  LongIndex operator()(TensorCoord const &coord) const {//liangjd
     //
     // First, compute c and s of vector within source (in units of vector
     // accesses)
     //
 
-    int vec_contiguous_idx = coord.contiguous() / kElementsPerAccess;
+    int vec_contiguous_idx = coord.contiguous() / kElementsPerAccess; //第几行
     int vec_strided_idx = coord.strided() / kFactor;
 
     // Compute the fundamental tile being accessed

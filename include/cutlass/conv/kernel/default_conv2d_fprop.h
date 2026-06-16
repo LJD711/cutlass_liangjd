@@ -1099,7 +1099,7 @@ struct DefaultConv2dFprop <
   StrideSupport,
   AlignmentA,
   AlignmentB
-> {
+> {// liangjd
 
   // Define the core components from GEMM
   using MmaCore = typename cutlass::gemm::threadblock::DefaultMmaCore<
