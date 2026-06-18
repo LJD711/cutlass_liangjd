@@ -212,39 +212,80 @@ struct PitchLinearTilePolicyStripminedThreadStrided
 /// elements.
 ///
 /// This ThreadMap is used by tensor core kernels.
+//
+// 下面以 default_mma_core_sm80.h 中 A operand 的典型实例化为例说明：
+//
+//   Shape_                 = layout::PitchLinearShape<Shape::kK, Shape::kM>
+//                          = layout::PitchLinearShape<64, 128>
+//   Threads                = kThreads = 128
+//   WarpThreadArrangement_ = layout::PitchLinearShape<8, 4>
+//   ElementsPerAccess      = 128 bits / sizeof_bits<half>::value = 8
+//
+// pitch-linear 坐标有两个维度：
+//
+//   contiguous: 连续内存方向。对 row-major GEMM A 来说就是 K 方向。
+//   strided:    跨行方向。对 row-major GEMM A 来说就是 M 方向。
+//
+// 所以这个实例描述的是：128 个线程如何覆盖一个 A tile，逻辑尺寸为
+// contiguous=K=64、strided=M=128。每个线程一次搬 8 个 half，也就是一个
+// 128b 向量。
 template <
+  // Shape_ 是整个线程块要覆盖的 pitch-linear tile 形状。
+  // 当前例子：Shape_ = PitchLinearShape<64, 128>，即 contiguous/K=64，
+  // strided/M=128，总元素数为 64 * 128 = 8192 个 half。
   typename Shape_,
+
+  // Threads 是参与搬运这个 tile 的 CTA 线程数。
+  // 当前例子：Threads = 128，对应 4 个 warp。
   int Threads,
+
+  // WarpThreadArrangement_ 描述一个 warp 内 32 个 lane 如何排成二维阵列。
+  // 当前例子：PitchLinearShape<8, 4>，表示一个 warp 中：
+  //   8 个 lane 沿 contiguous/K 方向排开；
+  //   4 组 lane 沿 strided/M 方向排开；
+  //   8 * 4 = 32 lane，刚好一个 warp。
   typename WarpThreadArrangement_,
+
+  // ElementsPerAccess 是单次向量化访问包含的元素个数。
+  // 当前例子：128b / 16b(half) = 8，所以一个 lane 一次读写 8 个 half。
   int ElementsPerAccess = 1
 >
 struct PitchLinearWarpRakedThreadMap {
 
   /// Tensor coordinate
+  // pitch-linear 坐标类型，包含 contiguous 和 strided 两个分量。
   using TensorCoord = layout::PitchLinearCoord;
 
   /// Tile shape
+  // 当前例子：Shape::kContiguous = 64，Shape::kStrided = 128。
   using Shape = Shape_;
 
   /// Number of threads total
+  // 当前例子：kThreads = 128。
   static int const kThreads = Threads;
 
   /// Extract vector length from Layout
+  // 当前例子：kElementsPerAccess = 8。
   static int const kElementsPerAccess = ElementsPerAccess;
 
   /// Shape of access by each thread
+  // 一个线程的一次访问覆盖 contiguous 方向的 8 个元素、strided 方向的 1 行。
+  // 当前例子：ThreadAccessShape = PitchLinearShape<8, 1>。
   using ThreadAccessShape = layout::PitchLinearShape<kElementsPerAccess, 1>;
 
   /// Internal details made public to facilitate introspection
   struct Detail {
 
     /// Fixed arrangement of threads within a warp (units of threads).
-    using WarpThreadArrangement = WarpThreadArrangement_;
+    // 当前例子：WarpThreadArrangement = PitchLinearShape<8, 4>。
+    using WarpThreadArrangement = WarpThreadArrangement_;// warp 内 32 个 lane 的排布。
 
     /// Number of threads per warp
+    // 当前例子：kWarpSize = 8 * 4 = 32。
     static int const kWarpSize = WarpThreadArrangement::kCount;
 
     /// Number of participating warps
+    // 当前例子：kWarpCount = 128 / 32 = 4。
     static int const kWarpCount = kThreads / kWarpSize;
 
     static_assert(
@@ -252,6 +293,10 @@ struct PitchLinearWarpRakedThreadMap {
       "Shape must be divisible by vector length.");
 
     /// Compute the 'shape' of the overall tile in units of vectors
+    // 把 contiguous/K 方向从“元素数”换算成“向量访问次数”。
+    // 当前例子：K=64，每次访问 8 个 half，所以 contiguous access 数是 64/8=8。
+    // strided/M 方向不做向量化，仍然是 128 行。
+    // 因此 ShapeInAccesses = PitchLinearShape<8, 128>。
     using ShapeInAccesses = layout::PitchLinearShape<
       Shape::kContiguous / kElementsPerAccess,
       Shape::kStrided
@@ -266,6 +311,10 @@ struct PitchLinearWarpRakedThreadMap {
       "ShapeInAccesses must be divisible by WarpThreadArrangement.");
 
     // compute number of warp-level accesses total
+    // 一个 warp 的 lane 排布是 <8,4>，所以：
+    //   contiguous 方向需要 8 / 8 = 1 轮 warp-level access；
+    //   strided/M 方向需要 128 / 4 = 32 轮 warp-level access。
+    // 当前例子：WarpAccessIterations = PitchLinearShape<1, 32>。
     using WarpAccessIterations = layout::PitchLinearShape<
       ShapeInAccesses::kContiguous / WarpThreadArrangement::kContiguous,
       ShapeInAccesses::kStrided / WarpThreadArrangement::kStrided
@@ -273,41 +322,66 @@ struct PitchLinearWarpRakedThreadMap {
 
     // Divide it into the number of warps, first partitioning the strided dimension then the
     // contiguous.
+    // 优先把多个 warp 分给 strided/M 方向。当前例子有 4 个 warp，strided 方向
+    // 有 32 轮可分，所以 4 个 warp 全部分到 strided 方向。
+    // 当前例子：kWarpsStrided = min(32, 4) = 4。
     static int const kWarpsStrided =
         (WarpAccessIterations::kStrided >= kWarpCount
              ? kWarpCount
              : WarpAccessIterations::kStrided);
 
+    // 如果 warp 数量多到 strided 方向放不下，才继续分给 contiguous 方向。
+    // 当前例子：kWarpCount=4 <= WarpAccessIterations::kStrided=32，
+    // 所以 kWarpsContiguous = 1。
     static int const kWarpsContiguous =
         (kWarpCount > WarpAccessIterations::kStrided
              ? kWarpCount / kWarpsStrided
              : 1);
 
     /// Arrangement of warps within a threadblock-scoped tile
+    // 当前例子：WarpArrangement = PitchLinearShape<1, 4>。
+    // 含义是 4 个 warp 不沿 K/contiguous 分裂，而是沿 M/strided 排开。
     using WarpArrangement = layout::PitchLinearShape<
       kWarpsContiguous, kWarpsStrided
     >;
   };
 
   ///< Iterations along each dimension (concept: PitchLinearShape)
+  // 每个 warp 自己还要循环多少次，才能覆盖分配给它的区域。
+  // 当前例子：
+  //   contiguous iterations = 1 / 1 = 1
+  //   strided iterations    = 32 / 4 = 8
+  // 因此 Iterations = PitchLinearShape<1, 8>。
+  // 注意：contiguous 方向只有 1 轮，所以当前例子每个线程的 K 向量位置固定；
+  // strided 方向有 8 轮，所以每个线程会访问 8 个不同的 M/NPQ 行。
   using Iterations = layout::PitchLinearShape<
     Detail::WarpAccessIterations::kContiguous / Detail::kWarpsContiguous,
     Detail::WarpAccessIterations::kStrided / Detail::kWarpsStrided
-  >;
+  >;//一共32轮，有4个warp，所以每个warp 8轮。contiguous 方向只有1轮，strided 方向8轮。
 
   static_assert(Iterations::kCount,
     "Number of iterations must be non-zero");
 
   ///< Delta between accesses (units of elements, concept: PitchLinearShape)
+  // 相邻 iteration 之间的坐标步长，单位是元素，不是向量。
+  // 当前例子：
+  //   Delta::kContiguous = 8 lane * 8 half/lane = 64
+  //   Delta::kStrided    = 4 rows
+  // 因此 Delta = PitchLinearShape<64, 4>。
+  // 当前 Iterations::kContiguous=1，所以 contiguous delta 实际不会被重复使用；
+  // strided loop 会让同一线程访问 M, M+4, M+8, ... 这些行。
   using Delta = layout::PitchLinearShape<
     Detail::WarpThreadArrangement::kContiguous * kElementsPerAccess,
     Detail::WarpThreadArrangement::kStrided
-  >;
+  >;//描述的是一个warp内的线程访问 pattern。每次迭代 contiguous 方向跳 64 个元素，strided 方向跳 4 行。
 
   /// Maps thread ID to a coordinate offset within the tensor's logical coordinate space
   CUTLASS_HOST_DEVICE
-  static TensorCoord initial_offset(int thread_id) {
+  static TensorCoord initial_offset(int thread_id) {//liangjd 输入线程ID，输出这个线程的初始访问坐标，单位是元素。
 
+    // 当前例子：thread_id 0..127。
+    //   warp_id = thread_id / 32，取值 0..3。
+    //   lane_id = thread_id % 32，取值 0..31。
     int warp_id = (thread_id / Detail::kWarpSize);
     int lane_id = (thread_id % Detail::kWarpSize);
 
@@ -316,28 +390,61 @@ struct PitchLinearWarpRakedThreadMap {
     //
 
     // This is the shape of the entire area covered by a warp's memory access (in units of vectors)
+    // warp_footprint 是一个 warp 负责区域的尺寸，单位是“向量访问”。
+    // 当前例子：
+    //   contiguous = 8 lane * 1 iteration = 8 vectors
+    //   strided    = 4 rows * 8 iterations = 32 rows
+    // 所以 warp_footprint = (8, 32)。换成元素就是 K=8*8=64，M=32。
     layout::PitchLinearCoord warp_footprint{
       Detail::WarpThreadArrangement::kContiguous * Iterations::kContiguous,
       Detail::WarpThreadArrangement::kStrided * Iterations::kStrided
-    };
+    };//warp的访问范围是 contiguous 方向 8 个向量，strided 方向 32 行。
 
     // This is the offset of a specific warp (in units of vectors)
+    // 当前例子 kWarpsContiguous=1，所以所有 warp 在 contiguous/K 方向 offset 都是 0；
+    // 4 个 warp 沿 strided/M 方向排布：warp_offset = (0, warp_id)。
     layout::PitchLinearCoord warp_offset{
       (warp_id % Detail::kWarpsContiguous),
       (warp_id / Detail::kWarpsContiguous)
-    };
+    };//描述的是不同 warp 之间的偏移。当前例子 warp_offset=(0,0),(0,1),(0,2),(0,3)。
 
     // This is the offset of a specific thread within a warp (units of vectors)
+    // 当前例子 WarpThreadArrangement=<8,4>：
+    //   lane 0..7   -> strided row group 0，contiguous vector 0..7
+    //   lane 8..15  -> strided row group 1，contiguous vector 0..7
+    //   lane 16..23 -> strided row group 2，contiguous vector 0..7
+    //   lane 24..31 -> strided row group 3，contiguous vector 0..7
     layout::PitchLinearCoord thread_offset_in_warp{
       lane_id % Detail::WarpThreadArrangement::kContiguous,
       lane_id / Detail::WarpThreadArrangement::kContiguous
-    };
+    };//warp 内线程的偏移。当前例子 lane 0..7 在 contiguous 方向访问 vector 0..7，lane 8..15 也访问 vector 0..7，但在 strided 方向偏移一行，以此类推。
 
     // This is the offset of a thread within a threadblock tile (units of vectors)
+    // 当前例子：
+    //   thread_offset_vec.contiguous = lane_id % 8
+    //   thread_offset_vec.strided    = warp_id * 32 + lane_id / 8
     layout::PitchLinearCoord thread_offset_in_threadblock_tile_vec =
       warp_footprint * warp_offset + thread_offset_in_warp;
-
+      //(8,32) *(0, warp_id) + (lane_id % 8, lane_id / 8)
     // This is the offset of a thread within a threadblock tile (units of elements)
+    // contiguous 从“向量编号”换回“元素编号”，所以要乘 kElementsPerAccess=8。
+    // 当前例子：
+    //   thread_offset_base.contiguous = (lane_id % 8) * 8
+    //   thread_offset_base.strided    = warp_id * 32 + lane_id / 8
+    //
+    // 例子：
+    //   thread 0  -> warp 0 lane 0  -> (K=0,  M=0)
+    //   thread 1  -> warp 0 lane 1  -> (K=8,  M=0)
+    //   thread 7  -> warp 0 lane 7  -> (K=56, M=0)
+    //   thread 8  -> warp 0 lane 8  -> (K=0,  M=1)
+    //   thread 31 -> warp 0 lane31  -> (K=56, M=3)
+    //   thread 32 -> warp 1 lane 0  -> (K=0,  M=32)
+    //
+    // 再结合 Iterations=<1,8> 和 Delta=<64,4>，thread 0 会访问：
+    //   (K=0..7, M=0), (K=0..7, M=4), ..., (K=0..7, M=28)
+    // thread 1 会访问：
+    //   (K=8..15, M=0), (K=8..15, M=4), ..., (K=8..15, M=28)
+    // 4 个 warp 合起来覆盖完整的 K=64, M=128 tile。
     layout::PitchLinearCoord thread_offset_in_threadblock_tile_base{
       thread_offset_in_threadblock_tile_vec.contiguous() * kElementsPerAccess,
       thread_offset_in_threadblock_tile_vec.strided()

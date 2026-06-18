@@ -1,0 +1,15 @@
+CompileFlags:
+  Add:
+    - -iquote
+    - /data/cutlass/include
+    - -iquote
+    - /data/cutlass/tools/util/include
+    - -iquote
+    - /data/cutlass/tools/library/include
+    - -iquote
+    - /data/cutlass/tools/profiler/include
+    - -I/data/cutlass/include
+    - -I/data/cutlass/tools/util/include
+    - -I/data/cutlass/tools/library/include
+    - -I/data/cutlass/tools/profiler/include
+    - -std=c++17

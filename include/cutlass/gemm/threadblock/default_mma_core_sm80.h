@@ -1444,6 +1444,25 @@ struct DefaultMmaCore<Shape_, WarpShape_, InstructionShape_, ElementA_,
   // Shared memory layouts
   //
 
+  // A 操作数在 shared memory 中不是普通 row-major 物理排布，而是
+  // Tensor Core 需要的 crosswise 排布。类型调用链是：
+  //
+  //   SmemLayoutA
+  //     -> layout::RowMajorTensorOpMultiplicandCrosswise<ElementBits, Crosswise>
+  //     -> layout::TensorOpMultiplicandCrosswise<ElementBits, Crosswise>
+  //     -> layout::TensorOpMultiplicand<ElementBits, Crosswise>::operator()
+  //
+  // RowMajorTensorOpMultiplicandCrosswise 会把 MatrixCoord(row, column)
+  // 转成 pitch-linear 坐标：contiguous = column，strided = row。底层 layout
+  // 再对 contiguous 方向的 128b 向量索引做 XOR 置换。这个置换就是 shared
+  // memory swizzle，用来让 128b store 以及后续 ldmatrix/ldsm load 更少产生
+  // bank conflict。
+  //
+  // 这个 layout 会在两处生效：
+  //   1. 下面的 SmemIteratorA 把从 global memory 读来的 A tile 写入 swizzle
+  //      之后的 shared memory 地址。
+  //   2. warp-level MmaTensorOp iterator 再按同一套 swizzle 地址从 shared
+  //      memory 读出 Tensor Core fragment。
   using SmemLayoutA = layout::RowMajorTensorOpMultiplicandCrosswise<
       sizeof_bits<ElementA>::value, Shape::kK>;//16 64
 
@@ -1456,6 +1475,62 @@ struct DefaultMmaCore<Shape_, WarpShape_, InstructionShape_, ElementA_,
   //
 
   /// ThreadMap of iterator A
+  //
+  // IteratorThreadMapA 描述的是：一个 CTA 内的 kThreads 个线程，如何协同搬运
+  // GEMM A tile。它本身不关心数据来自普通 GEMM 还是 implicit GEMM conv2d，
+  // 只定义逻辑 A 矩阵 tile 的线程分工。
+  //
+  // 对本特化而言，A 是 row-major 的 M x K 矩阵，因此连续内存方向是 K。
+  // PitchLinearShape<Shape::kK, Shape::kM> 把 A tile 写成 pitch-linear 形式：
+  //
+  //   contiguous = K 方向，也就是一行内连续的元素
+  //   strided    = M 方向，也就是不同的行
+  //
+  // 典型 conv2d fprop TensorOp 配置示例：
+  //
+  //   ThreadblockShape = GemmShape<128, 128, 64>
+  //   ElementA         = half
+  //   kThreads         = 128
+  //   kAccessSizeInBits = 128
+  //
+  // 则每次线程访问的元素个数为：
+  //
+  //   ElementsPerAccess = 128 bits / 16 bits = 8 half
+  //
+  // A tile 的 pitch-linear 形状是 (K=64, M=128)。一个 warp 有 32 个 lane，
+  // kWarpThreadArrangementContiguousA = 64 / 8 = 8，表示 8 个 lane 覆盖
+  // 一整行 K=64 的 8 个 128b 向量；kWarpThreadArrangementStridedA = 32 / 8 = 4，
+  // 表示这 32 个 lane 同时覆盖 4 个 M 行。
+  //
+  // PitchLinearWarpRakedThreadMap 会继续计算：
+  //
+  //   Iterations = (contiguous=1, strided=8)
+  //   Delta      = (contiguous=64, strided=4)
+  //
+  // 也就是说，每个线程在 contiguous/K 方向固定读一个 128b 向量，在
+  // strided/M 方向循环 8 次，每次跨 4 行。以 warp 0 为例：
+  //
+  //   lane 0 : K[0..7],   M = 0, 4, 8,  ..., 28
+  //   lane 1 : K[8..15],  M = 0, 4, 8,  ..., 28
+  //   ...
+  //   lane 7 : K[56..63], M = 0, 4, 8,  ..., 28
+  //   lane 8 : K[0..7],   M = 1, 5, 9,  ..., 29
+  //   ...
+  //   lane31 : K[56..63], M = 3, 7, 11, ..., 31
+  //
+  // 四个 warp 分别覆盖 M 的 [0..31], [32..63], [64..95], [96..127]，
+  // 合起来覆盖完整的 A tile: M=128, K=64。
+  //
+  // 在 conv2d fprop 的 implicit GEMM 中，这个 A tile 会被解释为：
+  //
+  //   A matrix = activation im2col view, shape NPQ x RSC
+  //   M 方向   = output position NPQ
+  //   K 方向   = filter position and input channel RSC
+  //
+  // 因此这里的 ThreadMap 后续会被
+  // Conv2dFpropActivationTileAccessIteratorOptimized 复用：同一个线程分工，
+  // 在 GEMM 看来是访问 A(m,k)，在 conv iterator 看来是访问 activation
+  // tensor 的 (n,h,w,c)。
   using IteratorThreadMapA = transform::PitchLinearWarpRakedThreadMap<
       layout::PitchLinearShape<Shape::kK, Shape::kM>, kThreads,//64 128
       layout::PitchLinearShape<kWarpThreadArrangementContiguousA,//8
