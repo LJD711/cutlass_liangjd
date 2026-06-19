@@ -87,7 +87,7 @@ struct TensorOpMultiplicand {
 
   /// Number of kblocks to store PartitionShape::kContiguous Elements
   static int const kFactor =
-      kTileShapeContiguous * kElementsPerAccess / kCrosswise;//8*8/64 = 1
+      kTileShapeContiguous * kElementsPerAccess / kCrosswise;//8*8/64 = 1  8个新元素，每个元素是8个单元，一共64个单元，正好是一个kblock
 
   static_assert(
       (kFactor > 0),
@@ -98,15 +98,15 @@ struct TensorOpMultiplicand {
   /// access, it also needs to be at least (kTileShapeContiguous / kFactor).
   /// See comments below
   static int const kTileShapeStride =
-      ((kTileShapeContiguous / kFactor) > (32 / kTileShapeContiguous))
-          ? (kTileShapeContiguous / kFactor)
-          : (32 / kTileShapeContiguous);
+      ((kTileShapeContiguous / kFactor) > (32 / kTileShapeContiguous)) // 8/1 > 32/8
+          ? (kTileShapeContiguous / kFactor) //8
+          : (32 / kTileShapeContiguous); //1
 
   /// Fundamental tile shape in units of vectors to guarantee bank conflict free
   /// shared memory load/store.
   /// For kFactor = 1, TileShape = <8, 8> 
   /// For kFactor > 1, TileShape = <8, 4>
-  using TileShape = PitchLinearShape<kTileShapeContiguous, kTileShapeStride>;
+  using TileShape = PitchLinearShape<kTileShapeContiguous, kTileShapeStride>;//8x8
 
   /// Fundamental partition shape in units of vectors
   using PartitionShape = PitchLinearShape<4, 4>;
@@ -149,57 +149,120 @@ struct TensorOpMultiplicand {
   /// Assumes coordinate has convention (contiguous, strided)
   CUTLASS_HOST_DEVICE
   LongIndex operator()(TensorCoord const &coord) const {//liangjd
+    // 输入坐标约定：
     //
-    // First, compute c and s of vector within source (in units of vector
-    // accesses)
+    //   coord.contiguous() : 逻辑连续维度。例如 RowMajorTensorOpMultiplicandCrosswise
+    //                        中对应 K/column 方向。
+    //   coord.strided()    : 逻辑非连续维度。例如 row-major A tile 中对应 M/row
+    //                        方向。
+    //
+    // 这个 layout 以 128-bit 向量为基本访问单位。以 fp16 为例，
+    // kElementsPerAccess = 128 / 16 = 8，所以连续维度上的元素 [0..7]
+    // 属于第 0 个 128-bit 向量，[8..15] 属于第 1 个向量。swizzle 发生在
+    // “向量坐标”上，不会打乱同一个 128-bit 向量内部的 8 个 fp16 元素。
+    //
+    // 地址计算分三层：
+    //
+    //   1. vec_*：       当前元素属于逻辑张量中的第几个 128-bit 向量。
+    //   2. tile_*：      当前向量位于哪个 fundamental shared-memory tile，
+    //                    以及在该 tile 内的位置。fp16 + Crosswise=64 时，
+    //                    TileShape 通常是 8x8 个 128-bit 向量。
+    //   3. partition_*： 每个 tile 再切成 4x4 个 128-bit 向量的小分区。
+    //                    下面两个 XOR 会分别置换“分区内的向量位置”和
+    //                    “tile 内的分区位置”。
+    //
+    // 目标：让相邻 strided 行在后续 warp 执行 ldmatrix/ldsm 时落到更分散的
+    // shared-memory bank 上。逻辑上矩阵仍然保持外层 wrapper 表达的
+    // row-major/column-major 坐标语义，但 shared memory 里的物理地址被置换。
+    //
+    // 先把标量元素坐标转换成 128-bit 向量坐标。
     //
 
-    int vec_contiguous_idx = coord.contiguous() / kElementsPerAccess; //第几行
-    int vec_strided_idx = coord.strided() / kFactor;
+    // contiguous 方向第几个 128-bit 向量。除以 kElementsPerAccess 是把
+    // 标量元素下标转换成向量下标。 coord.contiguous() = 43 coord.strided() = 5
+    int vec_contiguous_idx = coord.contiguous() / kElementsPerAccess; //第几个新的元素  5
 
-    // Compute the fundamental tile being accessed
+    // strided 方向第几组。kFactor 表示一个 strided 坐标会被拆到多少个
+    // crosswise section 中；除以 kFactor 是得到 section 组号。
+    int vec_strided_idx = coord.strided() / kFactor;// 5
+
+    // 当前向量位于第几个 fundamental tile 的 contiguous 方向。
+    // TileShape::kContiguous / kFactor 是一个 tile 在 contiguous 方向容纳的
+    // 向量数；整除得到 tile 编号。
     int tile_contiguous_idx =
-        vec_contiguous_idx / (TileShape::kContiguous / kFactor);
+        vec_contiguous_idx / (TileShape::kContiguous / kFactor);// 0
 
+    // 当前向量在该 tile 的 contiguous 方向余数。
+    // 第一项 `%` 得到向量在当前 tile 内的本地 contiguous 位置。
+    // 第二项处理 kFactor > 1 时同一 strided 坐标拆到不同 crosswise section
+    // 的情况，把 coord.strided() % kFactor 折叠进 contiguous 方向。
     int tile_contiguous_residual =
         vec_contiguous_idx % (TileShape::kContiguous / kFactor) +
-        ((coord.strided() % kFactor) * (TileShape::kContiguous / kFactor));
-    int tile_strided_residual = vec_strided_idx % TileShape::kStrided;
+        ((coord.strided() % kFactor) * (TileShape::kContiguous / kFactor));//5
 
-    // Compute the 'partition' within the fundamental tile
+    // 当前向量在该 tile 的 strided 方向余数。`% TileShape::kStrided` 表示
+    // 只关心 tile 内部第几行。
+    int tile_strided_residual = vec_strided_idx % TileShape::kStrided;// 5
+
+    // tile 内部再切成 4x4 vector partition。这里的除法得到当前属于第几个
+    // partition。一共是8x8，切成4x4，就是2x2个partition。
     int partition_contiguous_idx =
-        tile_contiguous_residual / PartitionShape::kContiguous;
+        tile_contiguous_residual / PartitionShape::kContiguous;// 1
     int partition_strided_idx =
-        tile_strided_residual / PartitionShape::kStrided;
+        tile_strided_residual / PartitionShape::kStrided; // 1  得出是第几个partition
 
+    // `%` 得到当前向量在 4x4 partition 内部的位置。
     int partition_contiguous_residual =
         tile_contiguous_residual % PartitionShape::kContiguous;
     int partition_strided_residual =
-        tile_strided_residual % PartitionShape::kStrided;
+        tile_strided_residual % PartitionShape::kStrided; //在partition内的行号和列号
 
     //
-    // Then swizzle
+    // 然后做 shared-memory swizzle。
     //
 
+    // partition 内部的 XOR：用 partition 内第几行
+    // partition_strided_residual 去异或低位 contiguous 向量下标。
+    // 对 4x4 partition 来说，partition_strided_residual % 4 就是行号，
+    // 这样不同行访问同一 logical column 时会被打散到不同 bank。
     int permuted_vec_contiguous_within_partition =
-        partition_contiguous_residual ^ (partition_strided_residual % 4);
+        partition_contiguous_residual ^ (partition_strided_residual % 4);//0 partition 内部位置从 contiguous=1 变成 contiguous=0。
 
+    // partition 级别的 XOR：用 partition_strided_idx 的奇偶性翻转
+    // partition_contiguous_idx，使相邻 partition 行在 contiguous 方向交错。
     int permuted_partition_contiguous_within_tile =
-        partition_contiguous_idx ^ (partition_strided_idx % 2);
+        partition_contiguous_idx ^ (partition_strided_idx % 2);//0 partition 本身从 contiguous partition 1 变成 0。
 
     //
-    // Compute final element location
+    // 根据 swizzle 后的位置重新合成最终标量元素坐标。
     //
 
+    // swizzle 后的 contiguous 标量元素下标：
+    //   1. tile_contiguous_idx * TileShape::kContiguous 定位到第几个 tile；
+    //   2. permuted_partition_contiguous_within_tile * PartitionShape::kContiguous
+    //      定位到 swizzle 后第几个 4x4 partition；
+    //   3. permuted_vec_contiguous_within_partition 定位到 partition 内第几个
+    //      128-bit 向量；
+    //   4. 乘 kElementsPerAccess 从向量下标转回标量元素下标；
+    //   5. 加 coord.contiguous() % kElementsPerAccess，保留向量内部元素偏移。
     int element_contiguous = (tile_contiguous_idx * TileShape::kContiguous +
                               permuted_partition_contiguous_within_tile *
                                   PartitionShape::kContiguous +
                               permuted_vec_contiguous_within_partition) *
                                  kElementsPerAccess +
-                             (coord.contiguous() % kElementsPerAccess);
+                             (coord.contiguous() % kElementsPerAccess);// (0 * 8 + 0 * 4 + 0) * 8 + (43 % 8) = 3
 
-    int element_strided = vec_strided_idx;
+    // strided 方向不参与 XOR swizzle；它使用前面按 kFactor 分组后的行号。
+    int element_strided = vec_strided_idx;//5
 
+    // 最终线性 offset：
+    //
+    //   element_contiguous
+    //     + element_strided * stride_[0] * kFactor
+    //
+    // stride_[0] 来自 packed shared-memory TensorRef，是逻辑 leading
+    // dimension。kFactor 用来补偿 kFactor > 1 时 strided 方向拆分到多个
+    // crosswise section 的情况。
     return element_contiguous + element_strided * stride_[0] * kFactor;
   }
 

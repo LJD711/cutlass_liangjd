@@ -254,10 +254,10 @@ struct ImplicitGemmConvolution {
 
       ThreadblockSwizzle threadblock_swizzle;
 
-      grid_tiled_shape = threadblock_swizzle.get_tiled_shape(
+      grid_tiled_shape = threadblock_swizzle.get_tiled_shape(//计算逻辑CTA网格
         implicit_gemm_problem_size,
         {ThreadblockShape::kM, ThreadblockShape::kN, ThreadblockShape::kK},
-        args.problem_size.split_k_slices);
+        args.problem_size.split_k_slices); //(25, 1, 1) 注意这不是cuda 真正启动的gridDim，而是逻辑上的CTA网格，和 threadblock_swizzle 的实现有关。
 
       swizzle_log_tile = threadblock_swizzle.get_log_tile(grid_tiled_shape);
     }
@@ -277,16 +277,135 @@ struct ImplicitGemmConvolution {
   ImplicitGemmConvolution() { } 
 
   /// Executes one ImplicitGEMM
+  //
+  // 这个 operator() 是每个 CUDA CTA 执行 Implicit GEMM convolution 的入口。
+  // host 侧的调用链大致是：
+  //
+  //   device::ImplicitGemmConvolution::initialize()
+  //     -> 根据用户 Arguments 构造 Params
+  //
+  //   device::ImplicitGemmConvolution::run()
+  //     -> Kernel<ImplicitGemmConvolution><<<grid, block, smem_size>>>(params)
+  //
+  //   cutlass::Kernel()
+  //     -> 从 extern __shared__ 得到 SharedStorage
+  //     -> op(params, shared_storage)
+  //
+  // operator() 的两个形参含义如下。
+  //
+  // 1. Params const &params
+  //
+  //   一个 CTA 只读的 kernel 运行参数。Params 最初在 host 侧由 Arguments
+  //   构造，然后作为 CUDA kernel 参数传到 device。这里用 const reference
+  //   避免在 operator() 内再次复制整个 Params。
+  //
+  //   Params 中最重要的字段包括：
+  //
+  //   problem_size:
+  //     原始 convolution 参数，例如 N/H/W/C、K、R/S、padding、stride、
+  //     dilation、groups 和 split_k_slices。
+  //
+  //   implicit_gemm_problem_size:
+  //     convolution 映射后的逻辑 GEMM 尺寸。以 fprop 为例：
+  //
+  //       GEMM M = N * P * Q
+  //       GEMM N = K
+  //       GEMM K = R * S * C
+  //
+  //     A 是 activation 的 NPQ x RSC 逻辑 im2col 视图，B 是 RSC x K
+  //     filter，输出 C/D 是 NPQ x K。
+  //
+  //   grid_tiled_shape:
+  //     逻辑 GEMM 被 ThreadblockShape 切分后的 CTA 网格，坐标为
+  //     (tile_m, tile_n, tile_k)。其中 tile_k 也用于 split-K slice。
+  //
+  //   swizzle_log_tile:
+  //     ThreadblockSwizzle 使用的 swizzle 参数，用于把 CUDA blockIdx
+  //     映射为逻辑 GEMM tile 坐标 threadblock_tile_idx。
+  //
+  //   gemm_k_iterations:
+  //     mainloop 沿 GEMM K/RSC 方向要执行的 threadblock K tile 数量。
+  //
+  //   gemm_k_iterations_per_channel:
+  //     fprop/dgrad 通常为 R*S，表示一个 channel 相关的 filter-position
+  //     iteration 数。它作为统一 Mma 接口参数传入；当前
+  //     ImplicitGemmMultistage 实现未直接使用该值，r/s/c 的实际推进由
+  //     A/B convolution iterator 的 advance() 完成。
+  //
+  //   iterator_A / iterator_B:
+  //     A/B global-memory iterator 的预计算参数，例如 tensor layout、
+  //     快速除法器和指针增量。它们不保存实际 tensor 数据。
+  //
+  //   ptr_A / ptr_B:
+  //     activation/filter 的 global-memory 起始地址。
+  //
+  //   iterator_C / iterator_D:
+  //     epilogue output iterator 的布局、stride 和 extent 参数。
+  //
+  //   ptr_C / ptr_D:
+  //     C 是 epilogue 的 source tensor，D 是最终 destination tensor。
+  //     常见输出计算为 D = alpha * accumulator + beta * C。
+  //
+  //   output_op:
+  //     epilogue 运算参数，例如 alpha、beta，以及可能的类型转换/激活配置。
+  //
+  //   semaphore:
+  //     serial split-K 使用的 workspace 锁数组。没有 split-K 时不会参与同步。
+  //
+  //   split_k_mode:
+  //     serial/parallel split-K 的执行与输出归约方式。
+  //
+  // 2. SharedStorage &shared_storage
+  //
+  //   当前 CTA 独占的 dynamic shared memory。它不是 host 参数，也不是每个
+  //   thread 各自一份；同一 CTA 的所有线程引用同一块 shared memory。
+  //   cutlass::Kernel() 通过 extern __shared__ 获得起始地址，再转换为
+  //   Operator::SharedStorage* 后传入这里。
+  //
+  //   SharedStorage 是 union：
+  //
+  //     main_loop: Mma pipeline 保存 A/B tile 的多 stage shared-memory buffer
+  //     epilogue:  epilogue 重排 accumulator 和协同写回所需的 shared memory
+  //
+  //   使用 union 的原因是 mainloop 完成后才执行 epilogue，两阶段生命周期
+  //   不重叠，因此可以复用同一块 shared memory；总大小取两者较大值，而
+  //   不是二者之和。
+  //
+  // 数值示例，仅用于理解：
+  //
+  //   convolution: N=1, P=Q=56, C=64, K=128, R=S=3, groups=1
+  //   ThreadblockShape = GemmShape<128, 128, 64>
+  //   split_k_slices = 1
+  //
+  // 则逻辑 GEMM 为 M=3136, N=128, K=576，普通 identity swizzle 下：
+  //
+  //   grid_tiled_shape.m = ceil(3136 / 128) = 25
+  //   grid_tiled_shape.n = ceil(128  / 128) = 1
+  //   grid_tiled_shape.k = 1
+  //   gemm_k_iterations  = 576 / 64 = 9
+  //
+  // 每个 CTA 负责一个 128 x 128 输出 tile，并循环 9 次搬运/计算
+  // 128 x 64 的 A tile 和 64 x 128 的 B tile。
   CUTLASS_DEVICE
-  void operator()(Params const &params, SharedStorage &shared_storage) {
+  void operator()(
+    Params const &params,          ///< CTA 只读的 convolution/kernel 运行参数
+    SharedStorage &shared_storage  ///< 当前 CTA 独占并由所有线程共享的 dynamic smem
+  ) {
 
     // Compute threadblock location
+    // ThreadblockSwizzle 把物理 CUDA blockIdx 映射到逻辑 GEMM tile 坐标。
+    // threadblock_tile_idx 的三个分量含义是：
+    //   m(): 当前 CTA 负责第几个 M/NPQ tile
+    //   n(): 当前 CTA 负责第几个 N/output-channel tile
+    //   k(): 当前 CTA 负责第几个 split-K slice
     ThreadblockSwizzle threadblock_swizzle;
 
     cutlass::gemm::GemmCoord threadblock_tile_idx =
         threadblock_swizzle.get_tile_offset(params.swizzle_log_tile);
 
     // Early exit if CTA is out of range
+    // 某些 swizzle 会把 grid shape 向上取整，边缘可能产生不对应有效
+    // M/N tile 的 CTA，因此这里先做边界检查。
     if (params.grid_tiled_shape.m() <= threadblock_tile_idx.m() ||
       params.grid_tiled_shape.n() <= threadblock_tile_idx.n()) {
 
@@ -294,8 +413,16 @@ struct ImplicitGemmConvolution {
     }
 
     // Compute position within threadblock
+    // thread_idx 是 CTA 内线程编号，范围为 [0, kThreadCount)。
     int thread_idx = threadIdx.x;
+
+    // A iterator 的 column 对应 implicit GEMM K/RSC 方向。
+    // split-K 时，第 k 个 slice 从 k * ThreadblockShape::kK 开始。
+    // 非 split-K 时 threadblock_tile_idx.k() 通常为 0。
     int iterator_A_column_offset = threadblock_tile_idx.k() * Mma::Shape::kK;
+
+    // Group convolution 需要把逻辑 K/RSC offset 进一步移动到当前 group
+    // 对应的 input-channel 区间。普通非 grouped convolution 不进入此分支。
     if (kGroupMode != GroupMode::kNone) {
       if (kGroupMode != GroupMode::kDepthwise) {
         int k_per_group = params.problem_size.K / params.problem_size.groups;
@@ -308,17 +435,28 @@ struct ImplicitGemmConvolution {
     } 
 
     // Construct iterators to A and B operands
+    //
+    // 对 fprop：
+    //   iterator_A 遍历 activation 的 NPQ x RSC 逻辑矩阵；
+    //   iterator_B 遍历 filter 的 RSC x K 逻辑矩阵。
+    //
+    // A 的 threadblock offset:
+    //   row    = tile_m * Shape::kM，定位到当前 NPQ tile
+    //   column = split-K/group 修正后的 RSC 起点
     typename Mma::IteratorA iterator_A(
       params.iterator_A,
       params.problem_size,
       params.ptr_A,
       thread_idx,
       MatrixCoord(
-        threadblock_tile_idx.m() * Mma::Shape::kM,
-        iterator_A_column_offset
+        threadblock_tile_idx.m() * Mma::Shape::kM,//逻辑M block上的偏移
+        iterator_A_column_offset//0 或者 split-K/group 修正后的 RSC 起点
       )
     );
     
+    // B 的 threadblock offset:
+    //   row    = tile_k * Shape::kK，定位到当前 RSC/split-K 起点
+    //   column = tile_n * Shape::kN，定位到当前 output-channel tile
     typename Mma::IteratorB iterator_B(
       params.iterator_B,
       params.problem_size,
@@ -332,6 +470,8 @@ struct ImplicitGemmConvolution {
 
     // Broadcast the warp_id computed by lane 0 to ensure dependent code
     // is compiled as warp-uniform.
+    // warp_idx 是 CTA 内 warp 编号，lane_idx 是 warp 内 lane 编号。
+    // 例如 128-thread CTA：warp_idx=0..3，lane_idx=0..31。
     int warp_idx = canonical_warp_idx_sync();
     int lane_idx = threadIdx.x % 32;
 
@@ -340,22 +480,35 @@ struct ImplicitGemmConvolution {
     //
 
     // Construct thread-scoped matrix multiply
+    // Mma 构造时会用 thread/warp/lane id 建立：
+    //   global -> shared 的 A/B store iterator
+    //   shared -> register 的 warp tile iterator
+    // 并把 mainloop buffer 绑定到 shared_storage.main_loop。
     Mma mma(shared_storage.main_loop, thread_idx, warp_idx, lane_idx);
 
+    // 每个线程持有自己负责的 accumulator fragment，位于寄存器中。
     typename Mma::FragmentC accumulators;
 
     accumulators.clear();
 
     // Compute threadblock-scoped matrix multiply-add
+    // mainloop 重复 gemm_k_iterations 次：
+    //   1. 从 global memory 读取 A/B tile
+    //   2. cp.async 写入 shared_storage.main_loop
+    //   3. warp 从 shared memory 取 fragment
+    //   4. Tensor Core MMA 累加到 accumulators
     mma(params.gemm_k_iterations, accumulators, iterator_A, iterator_B, accumulators, params.gemm_k_iterations_per_channel);
 
     //
     // Epilogue
     //
 
+    // 根据 host 传入的 output_op 参数构造 device epilogue operation。
     EpilogueOutputOp output_op(params.output_op);
 
     // Construct the semaphore.
+    // 同一个输出 (tile_m,tile_n) 的所有 split-K CTA 共用一个 semaphore。
+    // block_idx 将二维输出 tile 坐标展平，故不包含 tile_k。
     int block_idx = threadblock_tile_idx.m() + threadblock_tile_idx.n() * params.grid_tiled_shape.m();
 
     Semaphore semaphore(params.semaphore + block_idx, thread_idx);
@@ -374,6 +527,7 @@ struct ImplicitGemmConvolution {
       output_op.set_k_partition(threadblock_tile_idx.k(), params.grid_tiled_shape.k());
     }
 
+    // 输出矩阵 C/D 的 tile 起点。对 fprop，row 对应 NPQ，column 对应 K。
     MatrixCoord threadblock_offset(
       threadblock_tile_idx.m() * Mma::Shape::kM,
       threadblock_tile_idx.n() * Mma::Shape::kN
@@ -398,6 +552,8 @@ struct ImplicitGemmConvolution {
     );
 
     // Construct the epilogue
+    // mainloop 已经结束，因此 union 中原来的 main_loop 存储可以由
+    // shared_storage.epilogue 复用。
     Epilogue epilogue(
       shared_storage.epilogue, 
       thread_idx, 
@@ -422,6 +578,11 @@ struct ImplicitGemmConvolution {
     }
 
     // Run efficient epilogue
+    // 将各线程寄存器中的 accumulator fragment 协同重排并写入 D：
+    //
+    //   D = output_op(accumulators, C)
+    //
+    // 常见 LinearCombination 情况即 D = alpha * accumulator + beta * C。
     epilogue(output_op, iterator_D, accumulators, iterator_C);
   
     //

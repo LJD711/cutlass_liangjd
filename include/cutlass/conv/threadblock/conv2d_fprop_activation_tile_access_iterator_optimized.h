@@ -83,8 +83,8 @@ public:
   using ThreadMap = ThreadMap_;
   using AccessType = AccessType_;
   using TensorRef = cutlass::TensorRef<Element, Layout>;
-  using Index = typename Layout::Index;
-  using LongIndex = typename Layout::LongIndex;
+  using Index = typename Layout::Index;//int32_t
+  using LongIndex = typename Layout::LongIndex;//int64_t
   static IteratorAlgorithm const kIteratorAlgorithm = conv::IteratorAlgorithm::kOptimized;
   static StrideSupport const kStrideSupport = conv::StrideSupport::kStrided;
   static int const kConvDim = 2;
@@ -145,20 +145,52 @@ public:
 
     layout::PitchLinearCoord thread_coord = ThreadMap::initial_offset(thread_idx);
 
-    filter_c_ = threadblock_offset.column() + thread_coord.contiguous();
+    // ThreadMap 来自 GEMM A operand 的 IteratorThreadMapA。它给每个线程一个
+    // pitch-linear 初始坐标：
+    //
+    //   thread_coord.contiguous() -> GEMM A 的 K 方向偏移
+    //   thread_coord.strided()    -> GEMM A 的 M 方向偏移
+    //
+    // 对 implicit GEMM fprop，A matrix 是 activation 的 im2col 逻辑视图：
+    //
+    //   A(m, k) = activation[n, h, w, c]
+    //   m       = n * P * Q + p * Q + q       (NPQ 输出位置)
+    //   k       = (r * S + s) * C + c         (RSC 归约维)
+    //
+    // 所以这里的映射是：
+    //
+    //   contiguous/K -> c/filter_c_，也就是输入通道方向的向量偏移
+    //   strided/M    -> offset_npq，之后再拆成 n,p,q
+    //
+    // 典型例子：ThreadblockShape=<128,128,64>, ElementA=half, 128b access。
+    // IteratorThreadMapA 会令一个线程一次负责 8 个 half。warp 0 中：
+    //
+    //   lane 0 的 thread_coord = (contiguous=0,  strided=0)
+    //   lane 1 的 thread_coord = (contiguous=8,  strided=0)
+    //   lane 8 的 thread_coord = (contiguous=0,  strided=1)
+    //
+    // 如果 threadblock_offset=(M0=0, K0=0)，则 lane 0 初始读取
+    // activation 的 C[0..7]，lane 1 读取 C[8..15]，lane 8 读取下一条
+    // NPQ 行的 C[0..7]。下面的 strided iteration 会继续让同一个线程
+    // 访问 M+4, M+8, ... 这些 NPQ 行，从而覆盖完整 128x64 A tile。
+    filter_c_ = threadblock_offset.column() + thread_coord.contiguous(); //[0, 8, 16, ..., 120]
 
-    int offset_n[ThreadMap::Iterations::kStrided];
-    int offset_p[ThreadMap::Iterations::kStrided];
-    int offset_q[ThreadMap::Iterations::kStrided];
+    int offset_n[ThreadMap::Iterations::kStrided];//8
+    int offset_p[ThreadMap::Iterations::kStrided];//8
+    int offset_q[ThreadMap::Iterations::kStrided];//8 猜测是储存循环8次的指针偏移
 
     CUTLASS_PRAGMA_UNROLL
-    for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
+    for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {//8
 
       pointer_[s] = reinterpret_cast<char const *>(ptr);
  
+      // 这里的 s 是 ThreadMap 在 strided/M 方向的循环编号，不是 filter_s_。
+      // offset_npq 是当前线程本次访问负责的 GEMM A 行号，也就是输出坐标
+      // 展平后的 NPQ 索引。后面用 fast_divmod 把它还原成 n,p,q。
       int offset_npq = threadblock_offset.row() + thread_coord.strided() + s * ThreadMap::Delta::kStrided;
+      // threadblock_offset 线程块的偏移  thread_coord线程块每个warp的偏移以及线程在warp内的偏移  s * ThreadMap::Delta::kStrided 每次迭代的偏移。当前例子 thread_coord.strided() 是 0,1,2,3，Delta::kStrided=4，所以 offset_npq 是 M 方向的偏移，依次是 M, M+4, M+8, ... M+28。
 
-      // The subseqnet fast_divmod() operations are equivalent to the following logical computation:
+      // The subsequent fast_divmod() operations are equivalent to the following logical computation:
       //
       //
       //  offset_n[s] = offset_npq / (problem_size_.P * problem_size_.Q);
@@ -171,11 +203,24 @@ public:
       int residual;
 
       params.pq_divmod(offset_n[s], residual, offset_npq);
-      params.q_divmod(offset_p[s], offset_q[s], residual);
+      params.q_divmod(offset_p[s], offset_q[s], residual);//把 offset_npq 转成 n,p,q。当前例子是把 M 方向的偏移转成 n,p,q。
 
-      TensorCoord coord = at_(offset_n[s], offset_p[s], offset_q[s], 0, 0);
+      // at_() 用当前 filter_r_/filter_s_ 对应的 r,s 位置，把输出坐标
+      // (n,p,q) 映射回输入 activation 坐标 (n,h,w,c)：
+      //
+      //   h = p * stride_h - pad_h + r * dilation_h
+      //   w = q * stride_w - pad_w + s * dilation_w
+      //
+      // 构造函数阶段先使用 r=0,s=0 建立每个 strided iteration 的基准指针；
+      // 后续 advance() 会沿 filter_s_, filter_r_, filter_c_ 更新这些指针，
+      // 等价于沿 implicit GEMM 的 K/RSC 维继续前进。
+      TensorCoord coord = at_(offset_n[s], offset_p[s], offset_q[s], 0, 0);//n,p,q,r,s 映射回输入坐标 n,h,w,c 的函数。当前例子是 r=0,s=0，所以是映射回输入坐标 n,h,w,c 的函数。
 
       pointer_[s] += params_.layout(coord) * sizeof_bits<Element>::value / 8;
+      //params_.layout(coord) = ((n × H + h) × W + w) × C + c
+      // 因此 layout(coord) 的价值是把布局差异封装起来：
+      // iterator 只提供逻辑坐标 (n,h,w,c)
+      // layout 对象负责根据 NHWC 或 NCxHWx 计算实际线性偏移
     }
 
     clear_mask();

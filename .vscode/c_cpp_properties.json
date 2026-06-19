@@ -1,0 +1,30 @@
+{
+  "version": 4,
+  "configurations": [
+    {
+      "name": "CUTLASS local",
+      "includePath": [
+        "${workspaceFolder}/include",
+        "${workspaceFolder}/tools/util/include",
+        "${workspaceFolder}/tools/library/include",
+        "${workspaceFolder}/tools/profiler/include",
+        "${workspaceFolder}/examples",
+        "${workspaceFolder}/test"
+      ],
+      "browse": {
+        "path": [
+          "${workspaceFolder}/include",
+          "${workspaceFolder}/tools/util/include",
+          "${workspaceFolder}/tools/library/include",
+          "${workspaceFolder}/tools/profiler/include",
+          "${workspaceFolder}/examples",
+          "${workspaceFolder}/test"
+        ],
+        "limitSymbolsToIncludedHeaders": false
+      },
+      "cppStandard": "c++17",
+      "cStandard": "c17",
+      "intelliSenseMode": "linux-gcc-x64"
+    }
+  ]
+}

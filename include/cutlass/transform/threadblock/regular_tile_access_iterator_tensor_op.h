@@ -725,6 +725,31 @@ class RegularTileAccessIterator<
 ///            ReadableContiguousTileIteratorConcept |
 ///            WriteableContiguousTileIteratorConcept
 ///
+/// 这是主模板的一个偏特化。主模板参数顺序是：
+///
+///   RegularTileAccessIterator<Shape, Element, Layout, AdvanceRank,
+///                             ThreadMap, Alignment>
+///
+/// 下面 template<...> 这一行只是声明“这个偏特化还需要推导哪些参数”，
+/// 因此其中的 `int AdvanceRank` 不是主模板的第三个参数。主模板的第三个
+/// 参数 Layout 已经被下面的偏特化模式固定为：
+///
+///   layout::RowMajorTensorOpMultiplicandCrosswise<...>
+///
+/// 所以如下实例化：
+///
+///   RegularTileAccessIterator<MatrixShape<M,K>, ElementA, SmemLayoutA, 0,
+///                             IteratorThreadMapA>
+///
+/// 会按下面的方式匹配到本偏特化：
+///
+///   Shape_        = MatrixShape<M,K>
+///   Element_      = ElementA
+///   Layout        = RowMajorTensorOpMultiplicandCrosswise<...>  // SmemLayoutA
+///   AdvanceRank   = 0
+///   ThreadMap_    = IteratorThreadMapA
+///   Alignment     = 主模板默认值
+///
 template <typename Shape_, typename Element_, int AdvanceRank,
           typename ThreadMap_, int Alignment, int Crosswise>
 class RegularTileAccessIterator<Shape_, Element_,
@@ -753,8 +778,19 @@ class RegularTileAccessIterator<Shape_, Element_,
   using ThreadMap = ThreadMap_;
 
   /// Underlying iterator type
+  ///
+  /// row-major 矩阵坐标会被转换成 TensorOpMultiplicandCrosswise 使用的
+  /// pitch-linear 坐标约定：
+  ///
+  ///   MatrixCoord(row, column)
+  ///      -> PitchLinearCoord(contiguous = column, strided = row)
+  ///
+  /// 这个 wrapper 自己不计算 XOR swizzle，而是转交给 pitch-linear 版本的
+  /// TensorOpMultiplicandCrosswise iterator。后者的 TensorRef 会调用
+  /// TensorOpMultiplicandCrosswise::operator()，最终进入
+  /// TensorOpMultiplicand::operator() 完成地址置换。
   using UnderlyingIterator = RegularTileAccessIterator<
-      layout::PitchLinearShape<Shape::kColumn, Shape::kRow>, Element,
+      layout::PitchLinearShape<Shape::kColumn, Shape::kRow>, Element,//64 128
       layout::TensorOpMultiplicandCrosswise<sizeof_bits<Element_>::value,
                                             Crosswise>,
       (kAdvanceRank == 0 ? 1 : 0), ThreadMap_>;
@@ -771,6 +807,15 @@ class RegularTileAccessIterator<Shape_, Element_,
   RegularTileAccessIterator(TensorRef ref,  ///< Pointer to start of tensor
                             int thread_id   ///< ID of each participating thread
                             )
+      // `ref` 携带的是 RowMajorTensorOpMultiplicandCrosswise。这里传入
+      // {ref.data(), ref.stride()}，构造 UnderlyingIterator 使用的
+      // pitch-linear TensorRef。之后 UnderlyingIterator 初始化每个线程的
+      // shared memory 指针时，调用链是：
+      //
+      //   ThreadMap::initial_offset(thread_id)
+      //   -> TensorRef::offset(coord)
+      //   -> TensorOpMultiplicandCrosswise::operator()(coord)
+      //   -> TensorOpMultiplicand::operator()(coord)  // XOR swizzle
       : iterator_({ref.data(), ref.stride()}, thread_id) {}
 
   /// Overrides the internal iteration index
@@ -786,12 +831,17 @@ class RegularTileAccessIterator<Shape_, Element_,
   /// Returns a pointer
   CUTLASS_HOST_DEVICE
   AccessType *get() const {
+    // 返回当前 128-bit access 对应的 swizzled shared-memory 地址。
+    // 初始地址由上面的 layout 映射算出，后续再由底层 iterator 的
+    // iteration state 推进。
     return reinterpret_cast<AccessType *>(iterator_.get());
   }
 
   /// Adds a tile offset
   CUTLASS_DEVICE
   void add_tile_offset(TensorCoord const &coord) {
+    // row-major tile offset 先转换成 pitch-linear tile offset，
+    // 再交给底层 crosswise iterator 处理。
     iterator_.add_tile_offset({coord.column(), coord.row()});
   }
 

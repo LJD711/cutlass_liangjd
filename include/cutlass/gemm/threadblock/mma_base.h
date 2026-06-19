@@ -159,7 +159,7 @@ class MmaBase {
     //
 
     /// Buffer for A operand
-    AlignedBuffer<typename Operator::ElementA, ShapeA::kCount> operand_A;
+    AlignedBuffer<typename Operator::ElementA, ShapeA::kCount> operand_A;// 这个 buffer 是在 shared memory 上分配的，大小是 ShapeA::kCount 个元素，每个元素类型是 Operator::ElementA。
 
     /// Buffer for B operand
     AlignedBuffer<typename Operator::ElementB, ShapeB::kCount> operand_B;

@@ -139,6 +139,26 @@ struct DefaultConv2dFprop <
       Stages, MathOperatorTag>;
 
   // Define iterators over tiles from the A operand
+  //
+  // ThreadMapA 直接来自 GEMM MmaCore，也就是
+  // DefaultMmaCore::IteratorThreadMapA。这里没有为 conv2d 重新设计线程分工，
+  // 而是复用 GEMM A tile 的搬运方式。
+  //
+  // implicit GEMM fprop 会把 convolution 写成：
+  //
+  //   A = activation 的 im2col 逻辑视图，shape = NPQ x RSC
+  //   B = filter，                         shape = RSC x K
+  //   C = output，                         shape = NPQ x K
+  //
+  // 因此 ThreadblockShape::kM 对应一块 NPQ 输出位置，ThreadblockShape::kK
+  // 对应一块 RSC(filter_r, filter_s, channel) 归约维。MmaCore 认为 A 是
+  // row-major M x K；Conv2dFpropActivationTileAccessIteratorOptimized 则把
+  // 同一个 A(m,k) 坐标翻译回 activation tensor 的 (n,h,w,c) 地址。
+  //
+  // 例如 ThreadblockShape = <128,128,64> 且 ElementA=half 时，
+  // MmaCore::IteratorThreadMapA 会让 128 个线程覆盖一个 128x64 的 A tile。
+  // 对 conv2d 来说，这就是 128 个 NPQ 位置 x 64 个 RSC 元素。后面的
+  // IteratorA 使用 ThreadMapA 决定每个线程访问哪些 NPQ 行和哪些 C 通道向量。
   using ThreadMapA = typename MmaCore::IteratorThreadMapA;
   using AccessTypeA = cutlass::AlignedArray<ElementA, AlignmentA>;
   using IteratorA =

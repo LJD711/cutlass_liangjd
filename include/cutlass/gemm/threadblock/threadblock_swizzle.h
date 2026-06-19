@@ -110,12 +110,12 @@ struct GemmIdentityThreadblockSwizzle {
   static dim3 get_grid_shape(GemmCoord tiled_shape) {
     int tile = 1 << get_log_tile(tiled_shape);
     return dim3(tiled_shape.m() * tile, (tiled_shape.n() + tile - 1) / tile, tiled_shape.k());
-  }
+  } // (3, 7, 1) -> (12,2,1)
 
   /// Calculates optimal swizzle width
   CUTLASS_HOST_DEVICE
   static int get_log_tile(GemmCoord tiled_shape) {
-    auto n = tiled_shape.n();
+    auto n = tiled_shape.n();//(3, 7, 1) 的 n 是 7。若N=4，则返回2
     // Thresholds picked so that it doesn't cause too many no-op CTAs
     if (N >= 8 && n >= 6)
       return 3;
