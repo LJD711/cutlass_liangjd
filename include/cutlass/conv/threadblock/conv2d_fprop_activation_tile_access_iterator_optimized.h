@@ -92,7 +92,7 @@ public:
   
   using Mask = uint64_t;
 
-  static int const kAccessesPerVector = ThreadMap::kElementsPerAccess / AccessType::kElements;
+  static int const kAccessesPerVector = ThreadMap::kElementsPerAccess / AccessType::kElements;//8/4 =2
   
   static_assert(!(ThreadMap::kElementsPerAccess % AccessType::kElements), 
     "Vectors implied by the thread map must be divisible by the access type.");
@@ -174,6 +174,7 @@ public:
     // NPQ 行的 C[0..7]。下面的 strided iteration 会继续让同一个线程
     // 访问 M+4, M+8, ... 这些 NPQ 行，从而覆盖完整 128x64 A tile。
     filter_c_ = threadblock_offset.column() + thread_coord.contiguous(); //[0, 8, 16, ..., 120]
+    //本例，threadblock_offset.column() =0
 
     int offset_n[ThreadMap::Iterations::kStrided];//8
     int offset_p[ThreadMap::Iterations::kStrided];//8
@@ -216,7 +217,7 @@ public:
       // 等价于沿 implicit GEMM 的 K/RSC 维继续前进。
       TensorCoord coord = at_(offset_n[s], offset_p[s], offset_q[s], 0, 0);//n,p,q,r,s 映射回输入坐标 n,h,w,c 的函数。当前例子是 r=0,s=0，所以是映射回输入坐标 n,h,w,c 的函数。
 
-      pointer_[s] += params_.layout(coord) * sizeof_bits<Element>::value / 8;
+      pointer_[s] += params_.layout(coord) * sizeof_bits<Element>::value / 8;// *16/8=2
       //params_.layout(coord) = ((n × H + h) × W + w) × C + c
       // 因此 layout(coord) 的价值是把布局差异封装起来：
       // iterator 只提供逻辑坐标 (n,h,w,c)
@@ -320,12 +321,23 @@ public:
   /// Overrides the internal iteration index
   CUTLASS_HOST_DEVICE
   void set_iteration_index(Index index) {
-    iteration_vector_ = index % kAccessesPerVector;
-    int residual_access = index / kAccessesPerVector;
+    iteration_vector_ = index % kAccessesPerVector;//2
+    int residual_access = index / kAccessesPerVector;//2
 
     iteration_contiguous_ = residual_access % ThreadMap::Iterations::kContiguous;
     iteration_strided_ = residual_access / ThreadMap::Iterations::kContiguous;
   }
+  /*
+    index	iteration_strided_	iteration_vector_	访问内容
+    0	0	0	strided 行0，前4个 half
+    1	0	1	strided 行0，后4个 half
+    2	1	0	strided 行1，前4个 half
+    3	1	1	strided 行1，后4个 half
+    4	2	0	strided 行2，前4个 half
+    …	…	…	…
+    15	7	1	strided 行7，后4个 half
+    //get() 根据这两个变量产生实际地址：AccessType等于half4
+  */
 
   /// Adds a pointer offset in units of element
   CUTLASS_HOST_DEVICE
@@ -356,11 +368,11 @@ public:
     add_byte_offset_(params_.inc_next[next_idx]);
       
     if (next_idx == 2) {  
-      filter_c_ += params_.filter_c_delta;
+      filter_c_ += params_.filter_c_delta;//可能+64，这样就变成了64
     }
 
     CUTLASS_PRAGMA_UNROLL
-    for (int v_idx = 0; v_idx < kAccessesPerVector; ++v_idx) {
+    for (int v_idx = 0; v_idx < kAccessesPerVector; ++v_idx) {//2
       clear_mask(v_idx, filter_c_ + v_idx * AccessType::kElements >= problem_size_.C);
     }
   }

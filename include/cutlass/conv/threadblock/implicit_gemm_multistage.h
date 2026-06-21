@@ -204,7 +204,7 @@ public:
     int group_start_A = 0, int group_start_B = 0) {
 
     iterator_A.set_iteration_index(group_start_A *
-                                   IteratorA::kAccessesPerVector);
+                                   IteratorA::kAccessesPerVector);// *8
     this->smem_iterator_A_.set_iteration_index(group_start_A);
       
     // Async Copy for operand A
@@ -218,7 +218,7 @@ public:
 
         int const kSrcBytes = sizeof_bits<typename IteratorA::Element>::value *
                               IteratorA::ThreadMap::kElementsPerAccess /
-                              IteratorA::kAccessesPerVector / 8;
+                              IteratorA::kAccessesPerVector / 8;//每次拷贝8 字节
 
         CUTLASS_PRAGMA_UNROLL
         for (int v = 0; v < IteratorA::kAccessesPerVector; ++v) {
@@ -294,7 +294,7 @@ public:
 
       // Async Copy for operand A
       CUTLASS_PRAGMA_UNROLL
-      for (int j = 0; j < Detail::AsyncCopyIterationsPerStageA; ++j) {
+      for (int j = 0; j < Detail::AsyncCopyIterationsPerStageA; ++j) {//拷贝128x64的迭代次数
         typename IteratorA::AccessType *dst_ptr =
           reinterpret_cast<typename IteratorA::AccessType *>(
             this->smem_iterator_A_.get());
@@ -342,7 +342,7 @@ public:
       }
 
       // Move to the next stage
-      iterator_A.advance();
+      iterator_A.advance();//这一个stage拷贝的是k的一部分 8个线程一个拷贝k的一部分，下一个stage需要对原始指针进行偏移
       iterator_B.advance();
 
       this->smem_iterator_A_.add_tile_offset({0, 1});
