@@ -413,7 +413,7 @@ struct ImplicitGemmConvolution {
     }
 
     // Compute position within threadblock
-    // thread_idx 是 CTA 内线程编号，范围为 [0, kThreadCount)。
+    // thread_idx 是 CTA 内线程编号，范围为 [0, kThreadCount)。0-127
     int thread_idx = threadIdx.x;
 
     // A iterator 的 column 对应 implicit GEMM K/RSC 方向。

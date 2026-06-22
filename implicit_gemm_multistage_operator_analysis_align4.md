@@ -322,6 +322,127 @@ kAccessesPerGroupA × kAccessesPerVector
 每个 copy group 包含的 ThreadMap 逻辑 access 数量
 ```
 
+### 4.1 这里的 group 不是 convolution group
+
+`ImplicitGemmMultistage` 附近同时出现了多种名为 `group` 的概念，阅读时必须
+区分。第 381 行注释：
+
+```cpp
+// Start issuing the first group of the next stage outside of the mainloop
+copy_tiles_and_advance(iterator_A, iterator_B);
+```
+
+这里的 `first group` 指的是：
+
+```text
+一个完整 global-to-shared stage 中的第一个软件 copy group
+```
+
+它不是 group convolution 中的 `problem_size.groups`，也不是一个完整的
+shared-memory stage。
+
+#### 4.1.1 Software copy group
+
+本文主要讨论的 group 是软件层面的 copy group：
+
+```text
+一个完整 stage 的一部分 global-to-shared copy iteration
+```
+
+当前 A operand：
+
+```text
+一个完整 stage
+    = 8 个 ThreadMap 逻辑 access
+    = 16 条 cp.async / 线程
+
+一个 software copy group
+    = 2 个 ThreadMap 逻辑 access
+    = 4 条 cp.async / 线程
+
+一个完整 stage
+    = group0 + group1 + group2 + group3
+```
+
+把 stage 拆成四个 copy group，是为了把下一个 stage 的 global-memory load
+均匀穿插在当前 stage 的四次 warp MMA 计算之间。
+
+#### 4.1.2 Warp MMA K-group
+
+下面的调用操作的是另一种 group：
+
+```cpp
+warp_tile_iterator_A_.set_kgroup_index(...);
+warp_tile_iterator_B_.set_kgroup_index(...);
+```
+
+它表示当前 shared-memory stage 内，warp 正在读取哪个 K 子区间。
+
+当前：
+
+```text
+WarpShape::kK       = 64
+MMA instruction kK = 16
+```
+
+所以一个 shared-memory stage 有四个 warp MMA K-group：
+
+```text
+K-group0 = K[0..15]
+K-group1 = K[16..31]
+K-group2 = K[32..47]
+K-group3 = K[48..63]
+```
+
+它描述的是：
+
+```text
+shared memory -> warp register -> Tensor Core MMA
+```
+
+而 software copy group 描述的是：
+
+```text
+global memory -> shared memory
+```
+
+二者都被划分成四组，是为了让 copy 和 compute 一一交错，但它们不是同一种
+数据对象。
+
+#### 4.1.3 cp.async commit group
+
+还有第三种 group，由：
+
+```cpp
+cutlass::arch::cp_async_fence();
+```
+
+提交。
+
+在当前实现中，当某个 future tile 的 `group0..group3` 全部发射后，
+`cp_async_fence()` 将此前尚未提交的 `cp.async` 指令组成一个硬件可跟踪的
+异步 copy group。后面的：
+
+```cpp
+cp_async_wait<N>();
+```
+
+等待的是这种已提交的 cp.async group。
+
+因此三种 group 可以总结为：
+
+| 名称 | 数据路径 | 当前粒度 |
+|---|---|---|
+| software copy group | global memory -> shared memory | 完整 stage 的四分之一 |
+| warp MMA K-group | shared memory -> register/MMA | K=64 中的一个 K=16 子区间 |
+| cp.async commit group | cp.async 硬件队列 | 通常提交一个完整 future stage 的 copy |
+
+第 381 行的 `first group` 明确指第一种：
+
+```text
+software copy group0
+```
+
 ---
 
 ## 5. `set_iteration_index()` 的作用
@@ -957,6 +1078,133 @@ tile2 的 group0
 ```
 
 此时 tile2 的其余 group 尚未发出。
+
+### 13.1 为什么只发 group0，而不是发完整 stage2
+
+如果在这里一次性发射 stage2 的全部 16 条 `cp.async / 线程`，指令顺序会更接近：
+
+```text
+集中发射大量 global-to-shared copy
+        ↓
+集中执行当前 stage 的 warp MMA
+```
+
+这样访存和计算之间的交错较粗。
+
+CUTLASS 将 stage2 拆成四个 software copy group，并把它们分散到当前 stage
+的四次 `warp_mma_k` 附近：
+
+```text
+mainloop 前：      发射 stage2 group0
+warp_mma_k = 0：   发射 stage2 group1，同时计算当前 stage
+warp_mma_k = 1：   发射 stage2 group2，同时计算当前 stage
+warp_mma_k = 2：   发射 stage2 group3，同时计算当前 stage
+```
+
+这样下一个 stage 的 global-memory latency 可以被当前 stage 的 shared-memory
+load、fragment transform 和 Tensor Core MMA 覆盖。
+
+### 13.2 为什么 group0 必须放在 mainloop 外
+
+mainloop 内 `warp_mma_k=0` 对应的 copy 位置已经被安排给：
+
+```text
+当前 future tile 的 group1
+```
+
+具体公式为：
+
+```cpp
+group_start_iteration_A =
+    (warp_mma_k + 1) * Detail::kAccessesPerGroupA;
+```
+
+当：
+
+```text
+warp_mma_k = 0
+kAccessesPerGroupA = 2
+```
+
+得到：
+
+```text
+group_start_iteration_A = 2
+```
+
+也就是直接从 group1 开始。
+
+正常稳定运行时，一个 future tile 的 group0 是在“前一轮”的
+`warp_mma_k=3` 发出的：
+
+```text
+前一轮 warp_mma_k=3：future tile group0
+当前轮 warp_mma_k=0：future tile group1
+当前轮 warp_mma_k=1：future tile group2
+当前轮 warp_mma_k=2：future tile group3
+```
+
+但是第一次进入 mainloop 时不存在前一轮 `warp_mma_k=3`。如果不在第 381 行
+预先发射 tile2 的 group0，那么第一次 mainloop 只会发射 group1、group2、
+group3，tile2 的 copy 将不完整。
+
+所以第 381 行属于软件流水线的启动步骤，也可以称为：
+
+```text
+pipeline bootstrap / pipeline priming
+```
+
+它为第一次 mainloop 人工补上本应由“前一轮末尾”发射的 group0。
+
+### 13.3 第 381 行发生时三个 stage 的状态
+
+当前 `Stages=3`，prologue 已完成：
+
+```text
+global tile0 -> shared stage0，已经提交
+global tile1 -> shared stage1，已经提交
+```
+
+并且：
+
+```text
+global iterator -> tile2
+shared write iterator -> stage2
+shared read iterator -> stage0
+```
+
+因此第 381 行：
+
+```cpp
+copy_tiles_and_advance(iterator_A, iterator_B);
+```
+
+实际表示：
+
+```text
+从 global tile2 读取 group0
+        ↓ cp.async
+写入 shared stage2 对应位置
+```
+
+此时流水线状态可以画成：
+
+```text
+shared stage0：即将被 warp 计算
+shared stage1：已经预取，等待后续计算
+shared stage2：正在写入 tile2 的 group0
+```
+
+这里调用的函数名虽然是 `copy_tiles_and_advance()`，但它不会在函数内部调用
+global iterator 的 tile 级 `advance()`。函数中的 “advance” 主要表现为
+`operator++()` 推进当前 group 内的子访问。真正从 tile2 移到 tile3 的：
+
+```cpp
+iterator_A.advance();
+iterator_B.advance();
+```
+
+要等到 tile2 的 group3 发射完成后，在 `warp_mma_k=2` 对应的代码中执行。
 
 ```cpp
 int smem_write_stage_idx = Base::kStages - 1;

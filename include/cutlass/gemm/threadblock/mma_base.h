@@ -202,7 +202,7 @@ class MmaBase {
   //
 
   /// Iterator to load a warp-scoped tile of A operand from shared memory
-  typename Operator::IteratorA warp_tile_iterator_A_;
+  typename Operator::IteratorA warp_tile_iterator_A_; //MmaTensorOpMultiplicandTileIterator
 
   /// Iterator to load a warp-scoped tile of B operand from shared memory
   typename Operator::IteratorB warp_tile_iterator_B_;
@@ -221,7 +221,7 @@ public:
       ///< ID of each thread within a warp
       int lane_idx
     ):
-      warp_tile_iterator_A_(shared_storage.operand_A_ref(), lane_idx),
+      warp_tile_iterator_A_(shared_storage.operand_A_ref(), lane_idx),// mma base 也保存了operand_A_ref()，用于shared → registers
       warp_tile_iterator_B_(shared_storage.operand_B_ref(), lane_idx) {
 
   }

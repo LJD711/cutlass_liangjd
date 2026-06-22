@@ -118,7 +118,7 @@ public:
 
     /// Number of cp.async instructions to load one stage of operand A
     static int const AsyncCopyIterationsPerStageA =
-        IteratorA::ThreadMap::Iterations::kCount;
+        IteratorA::ThreadMap::Iterations::kCount; //8
 
     /// Number of cp.async instructions to load one stage of operand B
     static int const AsyncCopyIterationsPerStageB =
@@ -128,8 +128,8 @@ public:
     static int const kStages = Stages;
 
     /// Number of cp.async instructions to load on group of operand A
-    static int const kAccessesPerGroupA =
-        (AsyncCopyIterationsPerStageA + Base::kWarpGemmIterations - 1) / Base::kWarpGemmIterations;
+    static int const kAccessesPerGroupA = //每个组需要迭代几次
+        (AsyncCopyIterationsPerStageA + Base::kWarpGemmIterations - 1) / Base::kWarpGemmIterations;//2
 
     /// Number of cp.async instructions to load on group of operand B
     static int const kAccessesPerGroupB =
@@ -175,7 +175,7 @@ public:
       ///< ID of each thread within a warp
       int lane_idx
     ):
-      Base(shared_storage, thread_idx, warp_idx, lane_idx),
+      Base(shared_storage, thread_idx, warp_idx, lane_idx),// 初始化 Base 会初始化 warp_tile_iterator_A/B 和 smem_iterator_A/B
       smem_iterator_A_(shared_storage.operand_A_ref(), thread_idx),
       smem_iterator_B_(shared_storage.operand_B_ref(), thread_idx)
   {
@@ -204,7 +204,7 @@ public:
     int group_start_A = 0, int group_start_B = 0) {
 
     iterator_A.set_iteration_index(group_start_A *
-                                   IteratorA::kAccessesPerVector);// *8
+                                   IteratorA::kAccessesPerVector);// 2*2 =4
     this->smem_iterator_A_.set_iteration_index(group_start_A);
       
     // Async Copy for operand A
@@ -294,7 +294,7 @@ public:
 
       // Async Copy for operand A
       CUTLASS_PRAGMA_UNROLL
-      for (int j = 0; j < Detail::AsyncCopyIterationsPerStageA; ++j) {//拷贝128x64的迭代次数
+      for (int j = 0; j < Detail::AsyncCopyIterationsPerStageA; ++j) {//拷贝128x64的迭代次数 8
         typename IteratorA::AccessType *dst_ptr =
           reinterpret_cast<typename IteratorA::AccessType *>(
             this->smem_iterator_A_.get());
@@ -350,13 +350,13 @@ public:
 
       // Inserts a fence to group cp.async instructions into stages.
       cutlass::arch::cp_async_fence();
-    }
+    }//会提交Base::kStages - 1 =2 组异步拷贝
 
     // Perform accumulation in the 'd' output operand
     accum = src_accum;
 
     // Waits until kStages-2 stages have committed. 
-    cutlass::arch::cp_async_wait<Base::kStages - 2>();
+    cutlass::arch::cp_async_wait<Base::kStages - 2>();// 等1个异步拷贝未完成，也就是让一个异步拷贝完成，保证共享内存中有数据可以使用
     __syncthreads();
 
     // Pair of fragments used to overlap shared memory loads and math
@@ -378,9 +378,9 @@ public:
     ++this->warp_tile_iterator_B_;
 
     // Start issuing the first group of the next stage outside of the mainloop
-    copy_tiles_and_advance(iterator_A, iterator_B);
+    copy_tiles_and_advance(iterator_A, iterator_B); //只发射stage2的 copy iteration 0、1的异步拷贝，没有全部发射8次
 
-    int smem_write_stage_idx = Base::kStages - 1;
+    int smem_write_stage_idx = Base::kStages - 1;//2
     int smem_read_stage_idx = 0;
 
     warp_mma.transform(warp_transformed_frag_A[0], warp_transformed_frag_B[0],
@@ -410,7 +410,7 @@ public:
       // Computes a warp-level GEMM on data held in shared memory
       // Each "warp_mma_k" refers to a warp-level matrix multiply-accumulate
       CUTLASS_PRAGMA_UNROLL
-      for (int warp_mma_k = 0; warp_mma_k < Base::kWarpGemmIterations;
+      for (int warp_mma_k = 0; warp_mma_k < Base::kWarpGemmIterations;//4
            ++warp_mma_k) {
 
         // Load warp-level tiles from shared memory, wrapping to k offset if
@@ -434,7 +434,7 @@ public:
         // Issue global->shared copies for the next stage
         int group_start_iteration_A, group_start_iteration_B;
 
-        if (warp_mma_k + 1 == Base::kWarpGemmIterations) {
+        if (warp_mma_k + 1 == Base::kWarpGemmIterations) {// 64/16 = 4 如果是最后一次迭代，就发射下一组stage的前两次异步拷贝
           group_start_iteration_A = 0;
           group_start_iteration_B = 0;
         } else {
@@ -474,7 +474,7 @@ public:
                              warp_loaded_frag_A[(warp_mma_k + 1) % 2],
                              warp_loaded_frag_B[(warp_mma_k + 1) % 2]);
 
-        if (warp_mma_k + 2 == Base::kWarpGemmIterations) {
+        if (warp_mma_k + 2 == Base::kWarpGemmIterations) { // warp_mma_k =2 时，发射了stage2的最后一组异步拷贝，这时就需要等待了
           // Inserts a fence to group cp.async instructions into stages.
           cutlass::arch::cp_async_fence();
 

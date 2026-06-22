@@ -74,9 +74,9 @@ struct DefaultMmaTensorOp;
 /// Partial specialization for m-by-n-by-kgroup
 template <
     /// Shape of one matrix production operation (concept: GemmShape)
-    typename WarpShape_,
+    typename WarpShape_, //64x64x16
     /// Shape of one matrix production operation (concept: GemmShape)
-    typename InstructionShape_,
+    typename InstructionShape_, //16x8x16
     /// Data type of A elements
     typename ElementA,
     /// Layout of A matrix (concept: MatrixLayout)
