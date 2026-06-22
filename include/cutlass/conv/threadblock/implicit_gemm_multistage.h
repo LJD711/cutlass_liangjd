@@ -156,7 +156,7 @@ public:
   //
 
   /// Iterator to write threadblock-scoped tile of A operand to shared memory
-  SmemIteratorA smem_iterator_A_;
+  SmemIteratorA smem_iterator_A_;//
 
   /// Iterator to write threadblock-scoped tile of B operand to shared memory
   SmemIteratorB smem_iterator_B_;
@@ -177,7 +177,7 @@ public:
     ):
       Base(shared_storage, thread_idx, warp_idx, lane_idx),// 初始化 Base 会初始化 warp_tile_iterator_A/B 和 smem_iterator_A/B
       smem_iterator_A_(shared_storage.operand_A_ref(), thread_idx),
-      smem_iterator_B_(shared_storage.operand_B_ref(), thread_idx)
+      smem_iterator_B_(shared_storage.operand_B_ref(), thread_idx)//调用regular_tile_access_iterator_tensor_op.h 807行
   {
     // Compute warp location within threadblock tile by mapping the warp_id to
     // three coordinates:

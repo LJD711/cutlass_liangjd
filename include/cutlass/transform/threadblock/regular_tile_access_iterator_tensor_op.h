@@ -430,177 +430,369 @@ class RegularTileAccessIterator<
 ///            ReadableContiguousTileIteratorConcept |
 ///            WriteableContiguousTileIteratorConcept
 ///
+/// 以单元测试
+///
+///   SM80_Device_Conv2d_Fprop_Optimized_ImplicitGemm_
+///   f16nhwc_f16nhwc_f16nhwc_tensor_op_f16_align4
+///
+/// 的 operand A 为例，这个底层 pitch-linear 偏特化的完整实例化是：
+///
+///   Shape_       = layout::PitchLinearShape<64, 128>
+///   Element_     = cutlass::half_t
+///   Layout       = layout::TensorOpMultiplicandCrosswise<16, 64>
+///   AdvanceRank  = 1
+///   ThreadMap_   = PitchLinearWarpRakedThreadMap<
+///                    PitchLinearShape<64, 128>, 128,
+///                    PitchLinearShape<8, 4>, 8>
+///   Alignment    = 16 bytes
+///   Crosswise    = 64 elements
+///
+/// 注意：test 中的 AlignmentA=4 描述 global-memory activation iterator
+/// 每次读取 4 个 half。它不会传入本 shared-memory iterator。这里的
+/// Alignment 使用主模板默认值：
+///
+///   16 bits/half * 8 half/access / 8 = 16 bytes
+///
+/// 所以 global 的一个 8-half ThreadMap 向量会由两条 8-byte cp.async 写入，
+/// 但 shared iterator 的一个 AccessType 仍表示完整的 8 half / 128 bits。
+///
 template <typename Shape_, typename Element_, int AdvanceRank,
           typename ThreadMap_, int Alignment, int Crosswise>
 class RegularTileAccessIterator<Shape_, Element_,
                                 layout::TensorOpMultiplicandCrosswise<
                                     sizeof_bits<Element_>::value, Crosswise>,
-                                AdvanceRank, ThreadMap_, Alignment> {
+                                AdvanceRank, ThreadMap_, Alignment> {//liangjd
  public:
+  // AdvanceRank 指明 add_tile_offset() 的“前进维”。本实例中外层
+  // RowMajorTensorOpMultiplicandCrosswise wrapper 的 AdvanceRank=0（矩阵 column/K
+  // 方向），转换到 pitch-linear 坐标后成为 rank=1。这里允许 0 或 1。
   static_assert(
       AdvanceRank == 0 || AdvanceRank == 1,
       "Specialization for pitch-linear iterator may along advance along the "
       "contiguous(rank=0) or strided(rank=1) dimension.");
 
-  using Shape = Shape_;
-  using Element = Element_;
+  // 当前 pitch-linear tile 的逻辑形状，单位是标量 Element：
+  //   contiguous = 64  -> GEMM A 的 K 方向
+  //   strided    = 128 -> GEMM A 的 M/NPQ 方向
+  using Shape = Shape_; // PitchLinearShape<64, 128>
+
+  // shared memory 中保存的标量类型。当前为 half_t，16 bits / 2 bytes。
+  using Element = Element_; // cutlass::half_t
+
+  // shared-memory 物理布局。它保留逻辑的 pitch-linear 坐标语义，但通过
+  // TensorOpMultiplicand 的 XOR swizzle 将 128-bit 向量映射到物理地址，
+  // 以降低后续 ldmatrix 读取时的 bank conflict。
   using Layout =
       layout::TensorOpMultiplicandCrosswise<sizeof_bits<Element_>::value,
-                                            Crosswise>;
-  static int const kAdvanceRank = AdvanceRank;
-  static int const kAlignment = Alignment;
-  static int const kCrosswise = Crosswise;
+                                            Crosswise>; // <16 bits, 64 elements>
 
-  using Index = typename Layout::Index;
-  using LongIndex = typename Layout::LongIndex;
-  using StrideIndex = typename Layout::Stride::Index;
+  // tile offset 的推进维。当前值为 1。该常量主要保留 iterator 的类型语义；
+  // 本类 add_tile_offset() 接收完整的二维 coord，并分别计算两个方向的偏移。
+  static int const kAdvanceRank = AdvanceRank; // 1
 
+  // 访问对齐要求，单位是 bytes。当前为 16 bytes，即 128-bit 对齐。
+  static int const kAlignment = Alignment; // 16
+
+  // crosswise section 在 contiguous/K 方向包含的标量元素数。当前为 64 half，
+  // 恰好等于一个 CTA K tile；不同 pipeline stage 沿这个方向连续排布。
+  static int const kCrosswise = Crosswise; // 64
+
+  // 普通索引类型，用于 byte_offset_ 等单个 iterator 内部状态。当前为 int32_t。
+  using Index = typename Layout::Index; // int32_t
+
+  // 长索引类型，用于 pointer/tile offset，避免大型张量偏移溢出。当前为 int64_t。
+  using LongIndex = typename Layout::LongIndex; // int64_t
+
+  // Layout::Stride 是 Coord<1, int32_t, int64_t>；其 Index 为 int32_t。
+  // stride_ 保存的是经过“标量元素 -> 128-bit AccessType”换算后的步长。
+  using StrideIndex = typename Layout::Stride::Index; // int32_t
+
+  // 指向 shared-memory A tile 的 TensorRef，包含 Element* 和 swizzled Layout。
   using TensorRef = TensorRef<Element, Layout>;
-  using TensorCoord = typename Layout::TensorCoord;
 
+  // pitch-linear 逻辑坐标：(contiguous, strided)，当前分别对应 (K, M/NPQ)。
+  using TensorCoord = typename Layout::TensorCoord; // layout::PitchLinearCoord
+
+  // CTA 内线程如何覆盖 64x128 pitch-linear tile。当前关键常量：
+  //   kThreads                  = 128
+  //   kElementsPerAccess        = 8 half
+  //   Iterations                = <1, 8>
+  //   Delta                     = <64, 4>
+  //   WarpThreadArrangement     = <8, 4>
   using ThreadMap = ThreadMap_;
 
+  // 当前 Delta::kContiguous=64，kCrosswise=64，64 % 64 == 0。
+  // 要求每次 contiguous iteration 的跨度不能落在 crosswise section 中间，
+  // 否则下面按 section 计算地址的公式不成立。
   static_assert(!(ThreadMap::Delta::kContiguous % kCrosswise),
                 "kCrosswise is the smallest unit in the contiguous dimension "
                 "for shared memory swizzling.");
 
   /// Internal details made public to facilitate introspection
   struct Detail {
-    /// This iterator is specialized for an access size that is 128 bits in
-    /// length.
-    static int const kAccessSizeInBits = 128;
+    // 本 iterator 的一个逻辑 shared-memory access 固定为 128 bits。
+    // 当前就是 8 half = 8 * 16 = 128 bits。
+    static int const kAccessSizeInBits = 128; // 16 bytes
 
+    // 当前检查：16 bits/half * 8 half/access == 128 bits。
+    // 这也解释了为什么 global AlignmentA=4 不改变本类的 AccessType：
+    // 两条 4-half cp.async 最终共同填满一个 8-half shared access。
     static_assert(sizeof_bits<Element_>::value *
                           ThreadMap::kElementsPerAccess ==
                       kAccessSizeInBits,
                   "This iterator requires a policy whose access size is 128bs");
 
-    /// Number of pointers
-    ///
-    /// Note:TN kblock32 layouts only needs 1 pointer, but strangely
-    /// reducing pointer count hurts perfomrnace
+    // 保存几条预计算基础指针。当前 ThreadMap::Iterations::kStrided=8 > 1，
+    // 因而 kPointerCount=2。
+    //
+    // pointer_[0] 预计算当前线程第 0 个 strided 相位的 swizzled 地址；
+    // pointer_[1] 预计算向 strided 方向额外偏移 4 行后的地址。
+    // get() 用 iteration_strided_ 的最低位在二者间交替，从而避免每次访问
+    // 都重新执行完整 layout swizzle。剩余的偶数部分由 stride_idx 处理。
+    //
+    // Note: TN kblock32 layouts logically only need 1 pointer, but reducing the
+    // pointer count has historically hurt performance.
     static int const kPointerCount =
-        (ThreadMap::Iterations::kStrided > 1 ? 2 : 1);
+        (ThreadMap::Iterations::kStrided > 1 ? 2 : 1); // 当前为 2
   };
 
-  /// Element type per access
-  using AccessType = Array<Element, Layout::kElementsPerAccess>;
+  // 一次完整 shared-memory 访问的数据类型。
+  // Layout::kElementsPerAccess = 128 / 16 = 8，所以当前为：
+  //
+  //   Array<half_t, 8>
+  //
+  // 大小为 16 bytes。global align4 的两条 8-byte cp.async 会写入这个
+  // 16-byte 逻辑 access 的前半和后半。
+  using AccessType = Array<Element, Layout::kElementsPerAccess>; // Array<half_t, 8>
 
  private:
   //
   // Data members
   //
 
-  /// Total number of sections.  The memory is divided into stages.  One stage
-  /// can store one tile.  Stage is divided into sections.  Interleaved layout
-  /// can have multiple sections in a stage.  The rest layout only has one section
-  /// in a stage.
+  // 整个 shared-memory leading dimension 中包含多少个 crosswise section。
+  //
+  // 当前 Stages=3，A 的 shared storage 逻辑形状为：
+  //
+  //   MatrixShape<M=128, K=64*3=192>
+  //
+  // RowMajorTensorOpMultiplicandCrosswise::packed() 令 ref.stride(0)=192。
+  // 每个 section 包含 kCrosswise=64 个 contiguous 元素，所以：
+  //
+  //   sections_ = 192 / 64 = 3
+  //
+  // 当前每个 section 正好对应一个 pipeline stage 的 K=64 tile。
   int sections_;
 
-  /// Sections that a stage has
+  // 当前 iterator 的一个 Shape tile 包含多少个 section：
+  //
+  //   sections_per_stage_ = Shape::kContiguous / kCrosswise
+  //                       = 64 / 64
+  //                       = 1
+  //
+  // 泛化情况下，一个 stage 可能包含多个 crosswise section。
   int sections_per_stage_;
 
-  /// Stride value
+  // 经过 Layout factor 和 AccessType 宽度缩放后的 leading-dimension stride。
+  // 它不是 byte stride，也不是 half 元素 stride，而是 get()/tile offset 公式
+  // 使用的内部 128-bit access 步长：
+  //
+  //   stride_ = ref.stride(0) * Layout::kFactor /
+  //             Layout::kElementsPerAccess
+  //           = 192 * 1 / 8
+  //           = 24
+  //
+  // Layout::kFactor=1，Layout::kElementsPerAccess=8。
   StrideIndex stride_;
 
-  /// Internal pointer to first access of tile
+  // 当前线程的两条预计算 swizzled 基础指针，元素类型是 AccessType*，
+  // 因而 pointer + 1 前进 16 bytes，而不是前进一个 half。
+  //
+  // pointer_[0] 对应 ThreadMap::initial_offset(thread_id)；
+  // pointer_[1] 对应该坐标再加 (contiguous=0, strided=4)。
+  // 其中 4 来自 WarpThreadArrangement::kStrided。
   AccessType *pointer_[Detail::kPointerCount];
 
-  /// Internal byte offset
+  // 额外的动态 byte offset。它与 pointer_ 分离保存，使 add_pointer_offset()
+  // 不需要修改两个基础指针。构造时为 0。
+  //
+  // 注意单位是 byte；add_pointer_offset() 的输入单位则是 Element。
   Index byte_offset_;
 
-  /// Iteration in the contiguous dimension
+  // 当前 tile 内的 contiguous iteration 编号。当前 Iterations::kContiguous=1，
+  // 所以它在有效访问时总为 0；operator++() 每次立即将其回绕。
   int iteration_contiguous_;
 
-  /// Iteration in the strided dimension
+  // 当前 tile 内的 strided iteration 编号，范围 0..7。
+  //
+  // 对 thread 0 来说，八次访问对应 M 行：
+  //   0, 4, 8, 12, 16, 20, 24, 28
+  //
+  // get() 用其最低位选择 pointer_[0]/pointer_[1]，用其余偶数部分计算
+  // 更远的 strided 地址增量。
   int iteration_strided_;
 
  public:
-  /// Construct a TileIterator with zero threadblock offset
+  // 构造当前线程的 shared-memory write iterator。
+  //
+  // ref：
+  //   指向整个三阶段 A shared buffer；当前 layout stride 为 192 half。
+  //
+  // thread_id：
+  //   CTA 内线程编号 0..127，用 ThreadMap::initial_offset() 映射到本线程
+  //   在 64x128 pitch-linear tile 中的初始 (K,M) 坐标。
   CUTLASS_HOST_DEVICE
   RegularTileAccessIterator(TensorRef ref,  ///< Pointer to start of tensor
                             int thread_id   ///< ID of each participating thread
                             )
-      : sections_(ref.stride(0) / kCrosswise),
-        sections_per_stage_(Shape::kContiguous / kCrosswise),
+      : sections_(ref.stride(0) / kCrosswise), // 192 / 64 = 3
+        sections_per_stage_(Shape::kContiguous / kCrosswise), // 64 / 64 = 1
         // stride_ = kCrosswise x sections_ x kFactor
-        stride_(ref.stride(0) * Layout::kFactor / Layout::kElementsPerAccess),
-        byte_offset_(0) {
+        stride_(ref.stride(0) * Layout::kFactor /
+                Layout::kElementsPerAccess), // 192 * 1 / 8 = 24
+        byte_offset_(0) { // 初始无附加 byte offset
+    // 当前 ThreadMap 初始坐标公式：
+    //
+    //   warp_id = thread_id / 32
+    //   lane_id = thread_id % 32
+    //
+    //   thread_offset_base.contiguous = (lane_id % 8) * 8
+    //   thread_offset_base.strided    = warp_id * 32 + lane_id / 8
+    //
+    // 例如：
+    //   thread 0  -> (K=0,  M=0)
+    //   thread 1  -> (K=8,  M=0)
+    //   thread 8  -> (K=0,  M=1)
+    //   thread 32 -> (K=0,  M=32)
     layout::PitchLinearCoord thread_offset_base =
         ThreadMap::initial_offset(thread_id);
 
     CUTLASS_PRAGMA_UNROLL
+    // 当前 i=0,1，分别初始化两个 strided 相位的 swizzled 基础地址。
     for (int i = 0; i < Detail::kPointerCount; ++i) {
-      // This is the offset of a thread within a threadblock tile for a specific
-      // pointer (units of elements)
+      // 当前偏移为：
+      //
+      //   i=0: thread_offset_base + (0, 0)
+      //   i=1: thread_offset_base + (0, 4)
+      //
+      // 单位是 half 元素坐标，不是 byte 或 AccessType。
       layout::PitchLinearCoord thread_offset_in_threadblock_tile =
           thread_offset_base +
           layout::PitchLinearCoord{
               0, ThreadMap::Detail::WarpThreadArrangement::kStrided * i};
-      // initialize pointer
+
+      // ref.offset() 调用 TensorOpMultiplicandCrosswise layout，将逻辑 (K,M)
+      // 坐标转换成 XOR-swizzled 的标量 half offset。
+      //
+      // reinterpret_cast 后 pointer 运算单位变成 AccessType=8 half，所以标量
+      // offset 要除以 Layout::kElementsPerAccess=8。
       pointer_[i] = reinterpret_cast<AccessType *>(ref.data()) +
                     ref.offset(thread_offset_in_threadblock_tile) /
                         Layout::kElementsPerAccess;
     }
 
+    // 当前初始化为 iteration_contiguous_=0、iteration_strided_=0。
     set_iteration_index(0);
   }
 
-  /// Overrides the internal iteration index
+  // 将线性 ThreadMap access 编号拆成 contiguous/strided 两维。
+  //
+  // 当前 Iterations::kContiguous=1，因此：
+  //
+  //   iteration_contiguous_ = 0
+  //   iteration_strided_    = index
+  //
+  // index 的有效范围为 0..7。这里的 index 是 shared iterator 的完整
+  // 8-half 逻辑 access 编号，不是 global align4 iterator 的 4-half 子访问编号。
   CUTLASS_HOST_DEVICE
   void set_iteration_index(int index) {
     iteration_contiguous_ = index % ThreadMap::Iterations::kContiguous;
     iteration_strided_ = index / ThreadMap::Iterations::kContiguous;
   }
 
-  /// Adds a pointer offset in units of Element
+  // 添加以 Element 为单位的逻辑 pointer offset，但内部保存成 byte。
+  // 当前 Element=half，所以 pointer_offset=64 会增加 128 bytes。
+  //
+  // 它不改变 pointer_[0/1]，只更新 byte_offset_，最终由 get() 叠加。
   CUTLASS_HOST_DEVICE
   void add_pointer_offset(LongIndex pointer_offset) {
     byte_offset_ += pointer_offset * sizeof_bits<Element>::value / 8;
   }
 
-  /// Returns a pointer
+  // 返回当前 ThreadMap iteration 对应的 128-bit shared-memory 地址。
   CUTLASS_HOST_DEVICE
   AccessType *get() const {
+    // iteration_strided_ 的最低位选择预计算相位：
+    //
+    //   strided iteration 0,2,4,6 -> pointer_[0]
+    //   strided iteration 1,3,5,7 -> pointer_[1]
+    //
+    // pointer_[1] 本身已经比 pointer_[0] 多表示 4 个 strided 行。
     AccessType *access_ptr = pointer_[iteration_strided_ & 1];
+
+    // 清除最低位，留下需要额外跨越的偶数 iteration 数：
+    //
+    //   iteration_strided_: 0 1 2 3 4 5 6 7
+    //   stride_idx:         0 0 2 2 4 4 6 6
+    //
+    // 结合 pointer_[0/1] 后，对应行偏移为 0,4,8,12,16,20,24,28。
     int stride_idx = (iteration_strided_ & ~1);
 
+    // access_offset 的单位是 AccessType（每单位 8 half / 16 bytes）。
+    //
+    // 当前 contiguous iteration 恒为 0，所以第二项为 0。第一项化简为：
+    //
+    //   access_offset = stride_idx * 4 * 24 / 1
+    //                 = stride_idx * 96 AccessType
+    //
+    // 得到 0,0,192,192,384,384,576,576 个 AccessType 的额外偏移。
+    // 每增加 192 AccessType = 192*8=1536 half = 8 行*192 half/行，
+    // 正好在每两次 iteration 后再向 M 方向推进 8 行。
     int access_offset =
         stride_idx * ThreadMap::Delta::kStrided * stride_ / Layout::kFactor +
         // kCrosswise elements in the contiguous dimension would span to a
         // shared memory cache line.
         iteration_contiguous_ * (ThreadMap::Delta::kContiguous / kCrosswise) *
             Layout::TileShape::kContiguous;
+
+    // 先按 AccessType 单位叠加 access_offset，再转成 char*，以便精确叠加
+    // byte_offset_。当前正常 copy 路径下 byte_offset_ 初始为 0；切换 shared
+    // stage 时 add_tile_offset() 会通过它增加或减少 64 half = 128 bytes。
     char *access_byte_ptr =
         reinterpret_cast<char *>(access_ptr + access_offset);
+
+    // 返回当前 16-byte shared access 的最终地址。
     return reinterpret_cast<AccessType *>(access_byte_ptr + byte_offset_);
   }
 
-  /// Advances to the next tile in memory.
+  // 前进到当前 tile 内的下一个 ThreadMap 逻辑 access。
+  // 名字虽然是 operator++，但这里不会切换 pipeline stage；它只遍历
+  // Iterations=<1,8> 的内部访问状态。
   CUTLASS_HOST_DEVICE
   RegularTileAccessIterator &operator++() {
+    // 当前 kContiguous=1，所以每次 ++ 后都立即进入 contiguous 回绕。
     ++iteration_contiguous_;
 
     if (iteration_contiguous_ < ThreadMap::Iterations::kContiguous)
       return *this;
 
-    // Enter here only if (iteration_contiguous_ ==
-    // ThreadMap::Iteration::kContiguous)
+    // contiguous iteration 完成，回到 0，并进入下一个 strided iteration。
     iteration_contiguous_ = 0;
     ++iteration_strided_;
 
+    // iteration_strided_ 依次为 0..7；未完成 8 次访问时直接返回。
     if (iteration_strided_ < ThreadMap::Iterations::kStrided) {
       return *this;
     }
 
-    // Enter here only if (iteration_strided_ == ThreadMap::Iteration::kStrided)
-    // which means we enter the next section.
+    // 当前 tile 的 8 个逻辑 access 全部遍历完成后回绕到 (0,0)。
+    // 真正切换 shared pipeline stage 由 add_tile_offset() 完成。
     iteration_strided_ = 0;
 
     return *this;
   }
 
-  /// Advances to the next tile in memory.
+  // 后置递增：返回递增前的 iterator 副本，当前对象按上述规则前进一次。
   CUTLASS_HOST_DEVICE
   RegularTileAccessIterator operator++(int) {
     RegularTileAccessIterator prev(*this);
@@ -609,7 +801,27 @@ class RegularTileAccessIterator<Shape_, Element_,
     return prev;
   }
 
-  /// Adds a tile offset
+  // 按 pitch-linear tile 坐标移动 shared-memory 基址。
+  //
+  // 对 operand A，外层 row-major wrapper 调用：
+  //
+  //   add_tile_offset(MatrixCoord{0, 1})
+  //
+  // 会转换成底层：
+  //
+  //   coord = PitchLinearCoord{1, 0}
+  //
+  // 当前第一项计算为：
+  //
+  //   1 * sections_per_stage_(1) * stride_(24) *
+  //       ThreadMap::kElementsPerAccess(8) / sections_(3)
+  //   = 64 half
+  //
+  // 所以 shared write iterator 前进一个 stage 时增加 64 half = 128 bytes。
+  // 当环形缓冲回绕时 coord.contiguous()=-3，得到 -192 half，正好从
+  // stage3 末端回到 stage0。
+  //
+  // 第二项负责沿 strided tile 方向移动；当前 operand A 的 stage 切换不使用它。
   CUTLASS_DEVICE
   void add_tile_offset(TensorCoord const &coord) {
     add_pointer_offset(coord.contiguous() * sections_per_stage_ * stride_ *
@@ -755,7 +967,7 @@ template <typename Shape_, typename Element_, int AdvanceRank,
 class RegularTileAccessIterator<Shape_, Element_,
                                 layout::RowMajorTensorOpMultiplicandCrosswise<
                                     sizeof_bits<Element_>::value, Crosswise>,
-                                AdvanceRank, ThreadMap_, Alignment> {
+                                AdvanceRank, ThreadMap_, Alignment> {//liangjd
  public:
   static_assert(
       AdvanceRank == 0 || AdvanceRank == 1,
@@ -793,7 +1005,7 @@ class RegularTileAccessIterator<Shape_, Element_,
       layout::PitchLinearShape<Shape::kColumn, Shape::kRow>, Element,//64 128
       layout::TensorOpMultiplicandCrosswise<sizeof_bits<Element_>::value,
                                             Crosswise>,
-      (kAdvanceRank == 0 ? 1 : 0), ThreadMap_>;
+      (kAdvanceRank == 0 ? 1 : 0), ThreadMap_>;//匹配435行的RegularTileAccessIterator
 
   using AccessType = typename UnderlyingIterator::AccessType;
 

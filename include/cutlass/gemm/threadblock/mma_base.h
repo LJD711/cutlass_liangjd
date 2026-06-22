@@ -202,7 +202,7 @@ class MmaBase {
   //
 
   /// Iterator to load a warp-scoped tile of A operand from shared memory
-  typename Operator::IteratorA warp_tile_iterator_A_; //MmaTensorOpMultiplicandTileIterator
+  typename Operator::IteratorA warp_tile_iterator_A_; //  MmaTensorOpMultiplicandTileIterator
 
   /// Iterator to load a warp-scoped tile of B operand from shared memory
   typename Operator::IteratorB warp_tile_iterator_B_;
