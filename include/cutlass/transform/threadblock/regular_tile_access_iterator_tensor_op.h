@@ -665,7 +665,7 @@ class RegularTileAccessIterator<Shape_, Element_,
     //   thread 8  -> (K=0,  M=1)
     //   thread 32 -> (K=0,  M=32)
     layout::PitchLinearCoord thread_offset_base =
-        ThreadMap::initial_offset(thread_id);
+        ThreadMap::initial_offset(thread_id);//依旧是每行8个线程，访问16个元素，32线程访问4行
 
     CUTLASS_PRAGMA_UNROLL
     // 当前 i=0,1，分别初始化两个 strided 相位的 swizzled 基础地址。
@@ -688,7 +688,7 @@ class RegularTileAccessIterator<Shape_, Element_,
       // offset 要除以 Layout::kElementsPerAccess=8。
       pointer_[i] = reinterpret_cast<AccessType *>(ref.data()) +
                     ref.offset(thread_offset_in_threadblock_tile) /
-                        Layout::kElementsPerAccess;
+                        Layout::kElementsPerAccess;//底层调用swizzle()，将逻辑 (K,M) 坐标转换成 XOR-swizzled 的标量 half offset
     }
 
     // 当前初始化为 iteration_contiguous_=0、iteration_strided_=0。
@@ -706,8 +706,8 @@ class RegularTileAccessIterator<Shape_, Element_,
   // 8-half 逻辑 access 编号，不是 global align4 iterator 的 4-half 子访问编号。
   CUTLASS_HOST_DEVICE
   void set_iteration_index(int index) {
-    iteration_contiguous_ = index % ThreadMap::Iterations::kContiguous;
-    iteration_strided_ = index / ThreadMap::Iterations::kContiguous;
+    iteration_contiguous_ = index % ThreadMap::Iterations::kContiguous;//0
+    iteration_strided_ = index / ThreadMap::Iterations::kContiguous;//0..7
   }
 
   // 添加以 Element 为单位的逻辑 pointer offset，但内部保存成 byte。
