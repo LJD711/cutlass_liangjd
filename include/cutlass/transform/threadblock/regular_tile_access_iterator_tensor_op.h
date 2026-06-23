@@ -1005,7 +1005,7 @@ class RegularTileAccessIterator<Shape_, Element_,
       layout::PitchLinearShape<Shape::kColumn, Shape::kRow>, Element,//64 128
       layout::TensorOpMultiplicandCrosswise<sizeof_bits<Element_>::value,
                                             Crosswise>,
-      (kAdvanceRank == 0 ? 1 : 0), ThreadMap_>;//匹配435行的RegularTileAccessIterator
+      (kAdvanceRank == 0 ? 1 : 0), ThreadMap_>;//匹配461行的RegularTileAccessIterator
 
   using AccessType = typename UnderlyingIterator::AccessType;
 

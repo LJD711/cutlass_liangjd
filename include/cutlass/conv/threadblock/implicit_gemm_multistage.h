@@ -361,7 +361,7 @@ public:
 
     // Pair of fragments used to overlap shared memory loads and math
     // instructions
-    WarpLoadedFragmentA warp_loaded_frag_A[2];
+    WarpLoadedFragmentA warp_loaded_frag_A[2];//WarpLoadedFragmentA Array<half, 32>
     WarpLoadedFragmentB warp_loaded_frag_B[2];
     WarpTransformedFragmentA warp_transformed_frag_A[2];
     WarpTransformedFragmentB warp_transformed_frag_B[2];

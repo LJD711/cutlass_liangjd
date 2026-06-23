@@ -2163,7 +2163,7 @@ public:
 template <
     /// Size of the matrix to load (concept: PitchLinearShape)
     // warp iterator 一次逻辑 load 覆盖的完整 pitch-linear tile。
-    // 当前 A/B 都是 <contiguous=64, strided=64>。
+    // 当前 A/B 都是 <contiguous=64, strided=64>。 WarpShape_ 一个warp计算的gemmA大小
     typename Shape_,
     /// Identifies A or B multiplicand
     // 标识这是 A 还是 B。后面的 lane 地址公式会因 operand 不同选择不同分支。
@@ -2270,9 +2270,9 @@ class MmaTensorOpMultiplicandTileIterator<
     // Determine number of elements along outer dimension per individual LDSM op
     // Layout::kElementsPerAccess = 128 bits / 16 bits = 8 half。
     // 一个 AccessType/shared-memory vector 正好是 8 half = 16 bytes。
-    static int const kLdsmOpOuter = Layout::kElementsPerAccess;
+    static int const kLdsmOpOuter = Layout::kElementsPerAccess;//沿 contiguous/unit-stride 方向
     // ldmatrix 的基本 strided 高度固定按 8 行组织。
-    static int const kLdsmOpInner = 8;
+    static int const kLdsmOpInner = 8;//kLdsmOpInner：沿 strided/leading-dimension 方向
 
     // 当前 64 % 8 == 0，warp tile 的 K 维可以完整分成 128-bit vectors。
     static_assert(!(Shape::kContiguous % kLdsmOpOuter),
