@@ -78,15 +78,13 @@ def get_default_generated_ir_path(dsl_name: str = "CUTE_DSL") -> str:
         return str(p)
 
     try:
-        default_generated_ir_path = get_reusable_temp_dir("cutlass_python_cache")
+        return get_reusable_temp_dir("cutlass_python_cache")
     except Exception as e:
         fallback = str(tmp_dir / "cutlass_python_cache")
         log().warning(
             f"Could not determine user or create cache directory, using fallback path {fallback}. Error: {e}"
         )
         return fallback
-
-    return default_generated_ir_path
 
 
 default_generated_ir_path = get_default_generated_ir_path()
@@ -219,7 +217,9 @@ def save_ir(
     :rtype: str
     """
     initial_name = f"{dsl_name.lower()}_{fname}.mlir"
-    save_path = normalize_path(output_dir if output_dir else tempfile.gettempdir())
+    save_path = normalize_path(
+        output_dir if output_dir else get_default_generated_ir_path(dsl_name)
+    )
     save_fname = save_path / initial_name
     # Random ID to avoid any collisions
     rnd_id = str(uuid.uuid4())
@@ -259,7 +259,7 @@ def load_cache_from_path(
     :type dsl_name: str
     :param file: The name of the file to load.
     :type file: str
-    :param path: The path to the cache directory, defaults to default_generated_ir_path
+    :param path: The path to the cache directory, defaults to get_default_generated_ir_path(dsl_name)
     :type path: str, optional
     :param bytecode_reader: The bytecode reader to use, defaults to None
     :type bytecode_reader: callable, optional
@@ -302,7 +302,7 @@ def dump_cache_to_path(
     :type jit_function: JitCompiledFunction
     :param file: The name of the file to dump.
     :type file: str
-    :param path: The path to the cache directory, defaults to default_generated_ir_path
+    :param path: The path to the cache directory, defaults to get_default_generated_ir_path(dsl_name)
     :type path: str, optional
     :param bytecode_writer: The bytecode writer to use, defaults to None
     :type bytecode_writer: callable, optional

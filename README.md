@@ -1,9 +1,9 @@
 ![ALT](./media/images/gemm-hierarchy-with-epilogue-no-labels.png "Complete CUDA GEMM decomposition")
 # Overview
 
-# CUTLASS 4.5.2
+# CUTLASS 4.7.0
 
-_CUTLASS 4.5.2 - May 2026_
+_CUTLASS 4.7.0 - Aug 2026_
 
 CUTLASS is a collection of abstractions for implementing high-performance matrix-matrix multiplication (GEMM)
 and related computations at all levels and scales within CUDA. It incorporates strategies for
@@ -27,96 +27,57 @@ native support of such data types) across NVIDIA's Volta, Turing, Ampere, Ada, H
 
 To this rich ecosystem of C++ based kernel programming abstractions, CUTLASS 4 adds CUTLASS DSLs. These are Python native interfaces for writing high-performance CUDA kernels based on core CUTLASS and CuTe concepts without any performance compromises. This allows for a much smoother learning curve, orders of magnitude faster compile times, native integration with DL frameworks without writing glue code, and much more intuitive metaprogramming that does not require deep C++ expertise.
 
-Overall we envision CUTLASS DSLs as a family of domain-specific languages (DSLs). With the release of 4.0, we are releasing the first of these in CuTe DSL. This is a low level programming model that is fully consistent with CuTe C++ abstractions — exposing core concepts such as layouts, tensors, hardware atoms, and full control over the hardware thread and data hierarchy.
+Overall, we envision CUTLASS DSLs as a family of domain-specific languages (DSLs). With the release of 4.0, we released the first of these in CuTe DSL. This is a low-level programming model that is fully consistent with CuTe C++ abstractions - exposing core concepts such as layouts, tensors, hardware atoms, and full control over the hardware thread and data hierarchy.
 
 CuTe DSL demonstrates optimal matrix multiply and other linear algebra operations
 targeting the programmable, high-throughput _Tensor Cores_ implemented by
 NVIDIA's Ampere, Hopper, and Blackwell architectures.
 
 We believe it will become an indispensable tool for students, researchers, and performance
-engineers alike — flattening the learning curve of GPU programming, rapidly prototyping kernel
+engineers alike - flattening the learning curve of GPU programming, rapidly prototyping kernel
 designs, and bringing optimized solutions into production.
 
-CuTe DSL is currently in public beta and will graduate out of beta by end of summer 2025.
+CuTe DSL is currently in public beta and will graduate out of beta by end of summer 2026.
 
 To get started quickly - please refer :
   - [CUTLASS C++ Quick Start Guide](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/quickstart.html).
   - [CuTe DSL Quick Start Guide](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/quick_start.html).
 
-# What's New in CUTLASS 4.5
+# What's New in CUTLASS 4.7
 
 ## CuTe DSL
-* New features
-  - New Block API `block_copy()` to simplify TMA and S2T copy. Users can ignore detail about multicast and 2CTA partition for TMA by `block_copy()` and need not to invoke `tma_partition()`. And users can remove bulk of S2T initialization to simplify S2T copy.
-  - MXF8F6F4 mixed precision support
-    - BlockScaled MMA now supports MXF8*MXF4 or MXF8*MXF6
-  - Block Scaled MMA for SM120 now works on Spark
-  - EFC broadcast semantics support
-    -  EFC epilogue functions can now broadcast and remap tensor modes via `C.remap_modes[:, 0, 1]` subscript syntax (where `:` marks a broadcast dimension and integers select source mode indices). Covers scalar broadcast, row/column broadcast, and arbitrary mode permutations (e.g. transpose). The PyTorch reference evaluator mirrors the same transformations.
-  - Initial linter support: Improved type hints on CuTe DSL APIs to support static type checkers like MyPy
-  - dataclasses.dataclass is now supported for JIT compilaton and cute.compile for both plain and tvm-ffi path
-  - cute.copy now supports user specified loop unrolling
-  - Python 3.14t is now supported with GIL enabled
+* New features:
+  - Introduced the Primitives API which provides a lower-level abstraction beneath CuTe enabling Tensor Core programming through SIMT.  This provides a stable, thin wrapper over NVVM operations to use where CuTe abstractions reduce development velocity. Primitives are released as experimental and will evolve based on user feedback.
 
-* Bug fixing and improvements
-  - Improved source code correlation for profiling/debugging
-  - Fixed an aarch64 segfault issue with tvm-ffi
-  - Re-organization for CuTe DSL examples/tutorials for better discoverability
-  - Fixed following issues:
-    https://github.com/NVIDIA/cutlass/issues/3219
-    https://github.com/NVIDIA/cutlass/issues/3218
-    https://github.com/NVIDIA/cutlass/issues/3212
-    https://github.com/NVIDIA/cutlass/issues/3210
-    https://github.com/NVIDIA/cutlass/issues/3208
-    https://github.com/NVIDIA/cutlass/issues/3201
-    https://github.com/NVIDIA/cutlass/issues/3227
-    https://github.com/NVIDIA/cutlass/issues/3240
-    https://github.com/NVIDIA/cutlass/issues/3241
-  - Fixed Jax int64 stride divisibility issue
-  - Fixed issues for SM120 blockscaled MMAs
-    - added missing MXFP8MMAOP and MXF8F6F4MMAOP for sm120.
+    NOTE: Primitives is a transitional API until a CUDA Python-like solution is available.
+  - Introduced the Task Scheduling framework.  This provides static analysis of execution schedules for warp-specialized kernels.  Compilation stops when known concurrency issues are detected.  Also provides tools for visualizing resource/task dependencies and analyzing a kernel's schedule.
+  - Improved compiler diagnostics.  Register spills and use of local memory can now be reported at compile time with source line numbers. Preliminary support for detecting classes of NVVM synchronization and execution hazards at compile-time when using the Primitives API.  Better reporting of compiler errors that previously did not include source line numbers.
 
-* More examples of authorizing peak-performance kernels
-  - MOE examles
-    - A new style of grouped-gemm that aligns to torch's grouped_mm and scaled_groued_mm interface.
-    - Expert-wise tensormap descriptor setup by a cheap helper kernel (~2us) to avoid long latency in tile switching, kernel structure is much more closer to a normal GEMM.
-    - Compared to torch_210_cu13, very few problem has worse perf in B200.
-        - mxfp8_2dx3d: avg 1.29 speedup;
-        - mxfp8_2dx2d: avg 1.41 speedup;
-            - nvfp4_2dx3d: avg 1.11 speedup;
-        - nvfp4_2dx2d: avg 1.12 speedup (worst case 0.98)
-        - bf16_2dx3d: avg 1.15 speedup (worst case 0.98)
-        - bf16_2dx2d: avg 1.17 speedup (worst case 0.96)
-        - Note: The perf is measured from torch profiler, this impl includes the helper kernel + main kernel, while torch's includes its setup kernel and cutlass_cpp main kernel.
+This release has been tested against the following packages:
+  - FlashAttention: [main (c75d019)](https://github.com/Dao-AILab/flash-attention/commit/c75d019dea9d910312974417bc28f190dfdda6d9)
+  - Quack: [main (79517ae)](https://github.com/Dao-AILab/quack/commit/79517ae3063946fc2bb26a41bd45ee550e85cb26)
+  - FlashInfer: [main (4b964ec)](https://github.com/flashinfer-ai/flashinfer/commit/4b964ec4e147cf06a39e08b08c43188859df2652)
+  - cuDNN-Frontend:[deveop(5235c2b)](https://github.com/NVIDIA/cudnn-frontend/commit/5235c2bcaa7df095627cf51dcbe53a503d372855)
+  - Pytorch: [main(cf30153)](https://github.com/pytorch/pytorch/commit/cf30153c4c131c8164ee7798e5022d810682e2cb)
 
-* API changes
-  - ab_dtype is deprecated in make_trivial_tiled_mma and make_blockscaled_trivial_tiled_mma from blackwell_helpers.py. Please specify a_dtype and b_dtype separately instead.
+## CUTLASS Operator API
+* Custom epilogue fusions enhancements:
+  - Add support for scalar reductions.
+  - Add support to specify data movement strategy for each operand being loaded/stored.
 
-## CUTLASS C++
-* Add 2SM MMA instruction support to mixed TMA+CpAsync SM100 vanilla GEMM kernels.
-  - Mixed TMA+CpAsync can now accept static, but non trivial cluster shapes.
-  - Uses TMA multicast for A tile when using non-trivial cluster size along N mode.
-  - Uses an additional barrier (mma_trampoline_barrier) to track cp.async arrivals in both CTAs.
-  - Changes included in [example 92](https://github.com/NVIDIA/cutlass/tree/main/examples/92_blackwell_moe_gemm).
-* Add support for 128x32xK and 128x64xK tile sizes for SM120 blockscaled MMA collective builders, yielding up to 30% performance improvement on Blackwell SM121 related kernels.
-* Add static load to tensor memory support, included in [example 77](https://github.com/NVIDIA/cutlass/tree/main/examples/77_blackwell_fmha/).
-* Use 64-bit adds for SM100 MMA descriptor offsets and reduce move instructions for improved code generation.
-* Add [example 95](https://github.com/NVIDIA/cutlass/tree/main/examples/95_blackwell_gemm_green_context) to support green context SM partition
-  - Enables launching GEMM on stream with partial SM allocation.
-* Add [Snake](https://github.com/NVIDIA/cutlass/blob/main/test/unit/epilogue/thread/activation.cu#L409) activation functor for EVT.
-* Fix SM100 F8F6F4 SS MMA (1SM and 2SM) traits to use typed op templates.
-* Add UE8M0 (uniform exponent distribution) initialization support in tensor fill utilities.
-* Add `cvt.rn.bf16x2.e4m3x2` conversion instruction support to `numeric_conversion.h`.
-* Update [example 93](https://github.com/NVIDIA/cutlass/tree/main/examples/93_blackwell_low_latency_gqa) with paged KV cache support for Blackwell low-latency GQA.
-* Fix some kernel issues:
-  - Fix l2_capacity=0 handling in Blackwell SM100/SM120 kernel templates
-  - Fix CUTLASS clang build issues
-  - Remove `PipelineStorage` shadowing in SM100 complex epilogue
-  - Fix build issue in SM90 epilogue fusion visitor TMA warpspecialized
-  - Fix missing convert fucntion in EVT for fp4 kernels
-* Fix some profiler issues:
-  - Add missing reference kernels for blockwise GEMM profiler.
-  - Avoid instantiate 2sm tma kernels where ctaN is none power of 64 when ctaN > 128 in profiler.
+## C++
+* Add implementation of 2-kernel backward targeting at FP8 in [FMHA example](https://github.com/NVIDIA/cutlass/tree/main/examples/77_blackwell_fmha/).
+  - Added a backward fused multi-head attention benchmark with multi-precision (FP16/FP8), configurable batch/sequence/head sizes, variable-length and masking options, plus built-in correctness checks and runtime/throughput reporting.
+  - The 2-kernel backward has approximately 25% improvement compared to 1-kernel implementation at FP8 without mask on Blackwell SM103 chip.
+* Support CUDA 12.6 and newer structured bindings headers in NVRTC.
+* Add fp32/fp16/bf16/e4m3/e5m2 -> e2m1 (FP4) in NumericArrayConverter.
+* Optimize the E2M1 -> FP16 LUT decode helpers `_e2m1_to_half_x2` and `_e2m1_to_half_x4` by merging mask before prmt.
+* Fix some issues:
+  - Update streamk heuristic algorithm to optimize some kernels with mix cluster sizes.
+  - Avoid integer-sequence get ambiguity in CuTe tuple algorithms.
+  - Fix a TMA creation driver bug: detect if the first 128KiB is mapped in conservatively by checking if the tensor is compact, if so it is valid to flip the bit otherwise zero it.
+* Various improvements and fixes from the community and CUTLASS team. Thanks to everyone who submitted PRs!
+* Optimal code generation with CUDA toolkit versions 13.3.
 
 Note: CUTLASS 4.x builds are known to be down on Windows platforms for all CUDA toolkits.
 CUTLASS team is working on a fix.

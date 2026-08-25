@@ -9,10 +9,11 @@
 # and related documentation outside the scope permitted by the EULA
 # is strictly prohibited.
 
+from cutlass import AddressSpace
 from typing import Optional, Type
 
 from cutlass.cutlass_dsl import dsl_user_op
-from cutlass.base_dsl.arch import Arch
+from cutlass import base_dsl
 
 from cutlass._mlir import ir
 import cutlass._mlir.dialects.cute as _cute_ir
@@ -102,9 +103,7 @@ def retrieve_tmem_ptr(
             f"element_type must be a type of Numeric, but got {element_type}"
         )
 
-    res_ty = _cute_ir.PtrType.get(
-        element_type.mlir_type, _cute_ir.AddressSpace.tmem, alignment
-    )
+    res_ty = _cute_ir.PtrType.get(element_type.mlir_type, AddressSpace.tmem, alignment)
     return _cute_nvgpu_ir.arch_sm100_retrieve_tmem_ptr(
         res_ty,
         ptr_to_buffer_holding_addr.value,

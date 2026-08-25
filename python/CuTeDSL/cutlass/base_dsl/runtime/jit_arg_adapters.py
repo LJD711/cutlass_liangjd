@@ -13,7 +13,6 @@
 This module provides runtime utilities for JIT argument conversion in DSL.
 """
 
-from functools import wraps
 from typing import Callable, Any, Optional, get_origin
 from inspect import Parameter
 from dataclasses import is_dataclass, fields
@@ -70,7 +69,7 @@ def is_arg_annotation_constexpr(
 
     return (
         _is_reserved_python_func_arg(arg_index, arg_name, owning_func)
-        or (isinstance(arg_annotation, type) and issubclass(arg_annotation, Constexpr))
+        or (isinstance(arg_annotation, type) and issubclass(arg_annotation, Constexpr))  # type: ignore[misc]
         or (get_origin(arg_annotation) is Constexpr)
     )
 
@@ -115,12 +114,27 @@ class JitArgAdapterRegistry:
     # A dictionary with key=type and value=callable
     jit_arg_adapter_registry: dict[type, Any] = {}
 
+    # Adapters keyed by fully-qualified type name ("module.QualName") for
+    # types whose defining module is too expensive to import at registration
+    # time (e.g. torch). Promoted into jit_arg_adapter_registry on first
+    # lookup of an instance, which can only exist once the module is loaded.
+    lazy_jit_arg_adapter_registry: dict[str, Any] = {}
+
+    # Top-level module names of the lazy registrations, so lookups of
+    # unrelated types skip the qualified-name construction entirely.
+    _lazy_adapter_module_roots: set[str] = set()
+
     # Default adapters for arguments we don't know type names beforehand
     # Default dataclass adapter
     default_dataclass_adapter: Callable[[object], Any] | None = None
 
     @classmethod
-    def register_jit_arg_adapter(cls, *dargs: Any, **dkwargs: Any) -> Any:
+    def register_jit_arg_adapter(
+        cls,
+        python_type: "type | str | None" = None,
+        *,
+        lazy: bool = False,
+    ) -> Callable[[Any], Any]:
         """
         Register a JIT argument adapter callable
 
@@ -135,53 +149,95 @@ class JitArgAdapterRegistry:
             ...
 
         The adapters are registered per type. If a type is already registerd, an error will be raised.
+
+        With ``lazy=True`` the type is named by its fully-qualified
+        "module.QualName" string instead, so registration never imports the
+        defining module (e.g. torch). An instance of the type can only reach
+        a JIT function after the application has imported its module, so the
+        adapter is promoted to the concrete-type registry on first lookup.
         """
 
-        def decorator(*dargs: Any, **dkwargs: Any) -> Any:
-            darg_python_ty = dargs[0]
-
-            @wraps(darg_python_ty)
-            def wrapper(*args: Any, **kwargs: Any) -> Any:
-                if len(args) != 1 or not callable(args[0]):
-                    raise DSLRuntimeError(
-                        "a callable must be provided for registering JIT argument adapter"
-                    )
-                adapter = args[0]
-
-                if darg_python_ty in cls.jit_arg_adapter_registry:
-                    raise DSLRuntimeError(
-                        f"JIT argument adapter for {darg_python_ty} is already registered!",
-                        context={
-                            "Registered adapter": cls.jit_arg_adapter_registry[
-                                darg_python_ty
-                            ],
-                            "Adapter to be registered": adapter,
-                        },
-                    )
-                cls.jit_arg_adapter_registry[darg_python_ty] = adapter
-                return adapter
-
-            return wrapper
-
-        if len(dargs) > 0:
-            return decorator(*dargs, **dkwargs)
-        else:
+        if python_type is None:
             raise DSLRuntimeError(
                 "a Python type must be provided for registering JIT argument adapter"
             )
+        lazy_module_root: str | None = None
+        if lazy:
+            if not isinstance(python_type, str):
+                raise DSLRuntimeError(
+                    "a fully-qualified 'module.QualName' string must be provided "
+                    "for registering a lazy JIT argument adapter"
+                )
+            name_parts = python_type.split(".")
+            if len(name_parts) < 2 or not all(name_parts):
+                raise DSLRuntimeError(
+                    "lazy JIT argument adapter type name must be fully-qualified "
+                    "as 'module.QualName'"
+                )
+            lazy_module_root = name_parts[0]
+        elif isinstance(python_type, str):
+            raise DSLRuntimeError(
+                "non-lazy JIT argument adapters must be registered with a Python type"
+            )
+
+        def decorator(adapter: Any) -> Any:
+            if not callable(adapter):
+                raise DSLRuntimeError(
+                    "a callable must be provided for registering JIT argument adapter"
+                )
+
+            registry: Any = (
+                cls.lazy_jit_arg_adapter_registry
+                if lazy
+                else cls.jit_arg_adapter_registry
+            )
+            if python_type in registry:
+                raise DSLRuntimeError(
+                    f"JIT argument adapter for {python_type} is already registered!",
+                    context={
+                        "Registered adapter": registry[python_type],
+                        "Adapter to be registered": adapter,
+                    },
+                )
+            registry[python_type] = adapter
+            if lazy_module_root is not None:
+                cls._lazy_adapter_module_roots.add(lazy_module_root)
+            return adapter
+
+        return decorator
+
+    @classmethod
+    def _promote_lazy_adapter(cls, python_type: type) -> Any:
+        type_qualname = f"{python_type.__module__}.{python_type.__qualname__}"
+        adapter = cls.lazy_jit_arg_adapter_registry.pop(type_qualname, None)
+        if adapter is not None:
+            cls.jit_arg_adapter_registry[python_type] = adapter
+        return adapter
 
     @classmethod
     def get_registered_adapter(cls, arg: object) -> Any:
         """
         Get the registered JIT argument adapter for the given argument.
         """
-        adapter = cls.jit_arg_adapter_registry.get(type(arg), None)
+        python_type = type(arg)
+        adapter = cls.jit_arg_adapter_registry.get(python_type)
+
+        if (
+            adapter is None
+            and cls.lazy_jit_arg_adapter_registry
+            and python_type.__module__.partition(".")[0]
+            in cls._lazy_adapter_module_roots
+        ):
+            adapter = cls._promote_lazy_adapter(python_type)
+
         if adapter is None:
-            if (cls.default_dataclass_adapter
+            if (
+                cls.default_dataclass_adapter
                 and not implements_jit_argument(arg, partial=True)
                 and not implements_dynamic_expression(arg, partial=True)
                 and is_dataclass(arg)
-                and len(vars(arg)) == len(fields(arg))):  # no extra/missing instance attrs
+                and len(vars(arg)) == len(fields(arg))
+            ):  # no extra/missing instance attrs
                 adapter = cls.default_dataclass_adapter
         return adapter
 
@@ -198,25 +254,32 @@ class DefaultDataclassAdapter:
     """
     Adapter for dataclass typed JIT arguments.
     """
+
     def __init__(self, arg: object) -> None:
         self._ir_fields: dict[str, object] = {}
         self._ir_fields_len: dict[str, int] = {}
         self._arg = arg
-        for f in fields(arg): # type: ignore[arg-type]
+        for f in fields(arg):  # type: ignore[arg-type]
             arg_field = getattr(arg, f.name)
-            if not is_constexpr_field(f):
-                if isinstance(f.type, NumericMeta) and not isinstance(arg_field, f.type):
-                    self._ir_fields[f.name] = cast(arg_field, f.type) # type: ignore[arg-type]
+            if not is_constexpr_field(f, arg):
+                if isinstance(f.type, NumericMeta) and not isinstance(
+                    arg_field, f.type
+                ):
+                    self._ir_fields[f.name] = cast(arg_field, f.type)  # type: ignore[arg-type]
                 else:
                     # Allow the nested fields to be adapted
-                    arg_adapter = JitArgAdapterRegistry.get_registered_adapter(arg_field)
+                    arg_adapter = JitArgAdapterRegistry.get_registered_adapter(
+                        arg_field
+                    )
                     if arg_adapter is not None:
                         self._ir_fields[f.name] = arg_adapter(arg_field)
                     else:
                         self._ir_fields[f.name] = arg_field
 
     def __c_pointers__(self) -> list[Any]:
-        return list(chain.from_iterable(get_c_pointers(v) for v in self._ir_fields.values()))
+        return list(
+            chain.from_iterable(get_c_pointers(v) for v in self._ir_fields.values())
+        )
 
     def __get_mlir_types__(self) -> list[Any]:
         ir_types = []
@@ -231,18 +294,25 @@ class DefaultDataclassAdapter:
 
         kwargs = {}
         idx = 0
-        for f in fields(self._arg): # type: ignore[arg-type]
-            if is_constexpr_field(f):
+        for f in fields(self._arg):  # type: ignore[arg-type]
+            if is_constexpr_field(f, self._arg):
                 kwargs[f.name] = getattr(self._arg, f.name)
             else:
-                kwargs[f.name] = new_from_mlir_values(self._ir_fields[f.name], values[idx : idx + self._ir_fields_len[f.name]])
+                kwargs[f.name] = new_from_mlir_values(
+                    self._ir_fields[f.name],
+                    values[idx : idx + self._ir_fields_len[f.name]],
+                )
                 idx += self._ir_fields_len[f.name]
         return type(self._arg)(**kwargs)
 
     def __extract_mlir_values__(self) -> list[ir.Value]:
         from ..dsl import extract_mlir_values  # deferred to avoid circular import
 
-        return list(chain.from_iterable(extract_mlir_values(v) for v in self._ir_fields.values()))
+        return list(
+            chain.from_iterable(
+                extract_mlir_values(v) for v in self._ir_fields.values()
+            )
+        )
 
 
 JitArgAdapterRegistry.set_default_dataclass_adapter(DefaultDataclassAdapter)

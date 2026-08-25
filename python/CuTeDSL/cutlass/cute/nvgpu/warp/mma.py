@@ -10,14 +10,11 @@
 # is strictly prohibited.
 
 from dataclasses import dataclass
-from typing import Any, Optional, Type
+from typing import Any, Optional, Type, cast
 
 import enum
-from cutlass.base_dsl.arch import Arch
-from cutlass.cutlass_dsl import BaseDSL
-
-
-from ..common import OpError
+from cutlass import base_dsl
+from cutlass.cutlass_dsl import DSLUserCodeError, BaseDSL
 from ...typing import (
     Shape,
     Float4E2M1FN,
@@ -27,6 +24,7 @@ from ...typing import (
     Float16,
     BFloat16,
     Float32,
+    TFloat32,
     Numeric,
     Pointer,
 )
@@ -60,6 +58,33 @@ class MmaF16BF16Op(WarpMmaOp):
 
     See the `PTX documentation <https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-mma>`__.
     This Operation covers the instructions using the ``.f16`` or ``.bf16`` qualifiers for the input operands.
+
+    **Supported data type combinations:**
+
+    +-------------+-------------+----------+---------------------+
+    | A Data Type | B Data Type | Acc Type | Mma-MNK             |
+    +=============+=============+==========+=====================+
+    | F16         | F16         | F16, F32 | (16,8,8), (16,8,16) |
+    +-------------+-------------+----------+---------------------+
+    | BF16        | BF16        | F32      | (16,8,8), (16,8,16) |
+    +-------------+-------------+----------+---------------------+
+
+    **Supported architectures:** sm_80+
+
+    **Constraints:**
+
+    * Operand layout is fixed: A = row-major (K-major), B = col-major (K-major). Transpose is not supported.
+
+    **Execution Model:**
+
+    * WMMA (``mma.sync.aligned``) is a warp-collective synchronous operation. All lanes in the
+      warp must execute the same MMA instruction in convergence.
+    * In user code, ``cute.gemm(...)`` should be issued as warp-uniform code.
+
+    .. code-block:: python
+
+        cute.gemm(mma_atom, d, a, b, c)
+
     """
 
     ab_dtype: Type[Numeric]
@@ -68,23 +93,19 @@ class MmaF16BF16Op(WarpMmaOp):
 
     def __post_init__(self) -> None:
         if self.ab_dtype not in [Float16, BFloat16]:
-            raise OpError(
-                self,
+            raise DSLUserCodeError(
                 "expects the 'ab_dtype' Op parameter to be one of Float16 or BFloat16",
             )
         if self.acc_dtype not in [Float16, Float32]:
-            raise OpError(
-                self,
+            raise DSLUserCodeError(
                 "expects the 'acc_dtype' Op parameter to be one of Float16 or Float32",
             )
         if (self.ab_dtype == BFloat16) and (self.acc_dtype != Float32):
-            raise OpError(
-                self,
+            raise DSLUserCodeError(
                 "expects the 'acc_dtype' Op parameter to be Float32 when 'ab_dtype' is BFloat16",
             )
         if self.shape_mnk not in [(16, 8, 8), (16, 8, 16)]:
-            raise OpError(
-                self,
+            raise DSLUserCodeError(
                 "expects the 'shape_mnk' Op parameter to be one of (16,8,8) or (16,8,16)",
             )
 
@@ -136,12 +157,101 @@ class MmaF16BF16Trait(Trait):
 
 
 @dataclass(frozen=True)
+class MmaTF32Op(WarpMmaOp):
+    """TF32 warp-level MMA operation.
+
+    This wraps ``mma.sync.aligned.m16n8k{K}.row.col.f32.tf32.tf32.f32``.
+    Operands are TF32 and accumulation is F32.
+    """
+
+    shape_mnk: Shape
+
+    def __post_init__(self) -> None:
+        if self.shape_mnk not in [(16, 8, 4), (16, 8, 8)]:
+            raise DSLUserCodeError(
+                "expects the 'shape_mnk' Op parameter to be one of (16,8,4) or (16,8,8)",
+            )
+
+    def _make_trait(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+        **kwargs: Any,
+    ) -> "MmaTF32Trait":
+        shape_mnk = _pack_shape(self.shape_mnk, loc=loc, ip=ip)
+        ty = _cute_nvgpu_ir.MmaAtomSM80Type.get(
+            shape_mnk.type.attribute,
+            TFloat32.mlir_type,
+            TFloat32.mlir_type,
+            Float32.mlir_type,
+        )
+        return MmaTF32Trait(make_atom(ty, loc=loc, ip=ip))
+
+    def __str__(self) -> str:
+        return (
+            "warp-level TF32 MMA Operation"
+            + "\n  A/B data type         = TFloat32"
+            + "\n  Accumulator data type = Float32"
+            + f"\n  Instruction shape MNK = {self.shape_mnk}"
+        )
+
+    def _verify_fragment_A(
+        self,
+        input: Tensor,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> bool:
+        return True
+
+    def _verify_fragment_B(
+        self,
+        input: Tensor,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> bool:
+        return True
+
+
+class MmaTF32Trait(Trait):
+    pass
+
+
+@dataclass(frozen=True)
 class MmaFP8Op(WarpMmaOp):
     """
     FP8 warp-level MMA Operation (SM89).
 
     See the `PTX documentation <https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-mma>`__.
     This Operation covers the instructions using the ``.e4m3`` or ``.e5m2`` qualifiers for the input operands.
+
+    **Supported data type combinations:**
+
+    +-------------+-------------+----------+----------------------+
+    | A Data Type | B Data Type | Acc Type | Mma-MNK              |
+    +=============+=============+==========+======================+
+    | E4M3        | E4M3        | F16, F32 | (16,8,16), (16,8,32) |
+    +-------------+-------------+----------+----------------------+
+    | E5M2        | E5M2        | F16, F32 | (16,8,16), (16,8,32) |
+    +-------------+-------------+----------+----------------------+
+
+    **Supported architectures:** sm_89+
+
+    **Constraints:**
+
+    * Operand layout is fixed: A = row-major (K-major), B = col-major (K-major). Transpose is not supported.
+
+    **Execution Model:**
+
+    * WMMA (``mma.sync.aligned``) is a warp-collective synchronous operation. All lanes in the
+      warp must execute the same MMA instruction in convergence.
+    * In user code, ``cute.gemm(...)`` should be issued as warp-uniform code.
+
+    .. code-block:: python
+
+        cute.gemm(mma_atom, d, a, b, c)
     """
 
     ab_dtype: Type[Numeric]
@@ -150,18 +260,15 @@ class MmaFP8Op(WarpMmaOp):
 
     def __post_init__(self) -> None:
         if self.ab_dtype not in [Float8E4M3FN, Float8E5M2]:
-            raise OpError(
-                self,
+            raise DSLUserCodeError(
                 "expects the 'ab_dtype' Op parameter to be one of Float8E4M3FN or Float8E5M2",
             )
         if self.acc_dtype not in [Float16, Float32]:
-            raise OpError(
-                self,
+            raise DSLUserCodeError(
                 "expects the 'acc_dtype' Op parameter to be Float32 or Float16",
             )
         if self.shape_mnk not in [(16, 8, 32), (16, 8, 16)]:
-            raise OpError(
-                self,
+            raise DSLUserCodeError(
                 "expects the 'shape_mnk' Op parameter to be (16,8,32) or (16,8,16)",
             )
 
@@ -223,70 +330,58 @@ class MmaSM120BlockScaledOp(MmaOp):
     use_sf_layout_TV: bool = False
 
     admissible_archs = [
-        Arch.sm_120a,
-        Arch.sm_120f,
-        Arch.sm_121a,
-        Arch.sm_121f,
+        base_dsl.Arch.sm_120a,
+        base_dsl.Arch.sm_120f,
+        base_dsl.Arch.sm_121a,
+        base_dsl.Arch.sm_121f,
     ]
 
     def __post_init__(self) -> None:
         # Verify arch
         arch = BaseDSL._get_dsl().get_arch_enum()
         if arch not in self.admissible_archs:
-            raise OpError(
-                self,
-                f"expects arch to be one of {self.admissible_archs}, but got {arch}"
-                " - Note: sm_120f is currently not supported, "
-                " please compile for your local GPU architecture instead with env "
-                "CUTE_DSL_ARCH set to sm_120a or sm_121a",
+            raise DSLUserCodeError(
+                f"expects arch to be one of {self.admissible_archs}, but got {arch}",
                 suggestion="Ensure env CUTE_DSL_ARCH matches your GPU architecture",
             )
         # (ab_dtype, shape_mnk) consistency: FP4 uses (16,8,64); FP8 uses (16,8,32).
         if self.ab_dtype == Float4E2M1FN:
             if self.shape_mnk != (16, 8, 64):
-                raise OpError(
-                    self,
+                raise DSLUserCodeError(
                     "expects the 'shape_mnk' Op parameter to be (16,8,64) for Float4E2M1FN",
                 )
         elif self.ab_dtype in (Float8E4M3FN, Float8E5M2):
             if self.shape_mnk != (16, 8, 32):
-                raise OpError(
-                    self,
+                raise DSLUserCodeError(
                     "expects the 'shape_mnk' Op parameter to be (16,8,32) for Float8E4M3FN/Float8E5M2",
                 )
         else:
-            raise OpError(
-                self,
+            raise DSLUserCodeError(
                 "expects the 'ab_dtype' Op parameter to be Float4E2M1FN, Float8E4M3FN, or Float8E5M2",
             )
         if self.acc_dtype != Float32:
-            raise OpError(
-                self,
+            raise DSLUserCodeError(
                 "expects the 'acc_dtype' Op parameter to be Float32",
             )
 
         if self.sf_vec_size == 16:
             # vec_size=16 is only valid for FP4 (NVFP4) with E4M3 scale.
             if self.ab_dtype != Float4E2M1FN:
-                raise OpError(
-                    self,
+                raise DSLUserCodeError(
                     "expects the 'sf_vec_size' Op parameter to be 32 for Float8E4M3FN/Float8E5M2",
                 )
             if self.sf_type != Float8E4M3FN:
-                raise OpError(
-                    self,
+                raise DSLUserCodeError(
                     "expects the 'sf_type' Op parameter to be Float8E4M3FN",
                 )
         elif self.sf_vec_size == 32:
             # vec_size=32 path uses UE8M0 scale for both FP4 (MXF4) and FP8 (MXF8).
             if self.sf_type != Float8E8M0FNU:
-                raise OpError(
-                    self,
+                raise DSLUserCodeError(
                     "expects the 'sf_type' Op parameter to be Float8E8M0FNU",
                 )
         else:
-            raise OpError(
-                self,
+            raise DSLUserCodeError(
                 "expects the 'sf_vec_size' Op parameter to be 16 or 32",
             )
 
@@ -356,17 +451,18 @@ class MmaBlockScaledTrait(Trait):
             raise ValueError(
                 f"expects field to be one of {self.admissible_fields}, but got {field}"
             )
+        mlir_operand = value
         if field in [Field.SFA, Field.SFB]:
             if not isinstance(value, Pointer):
                 raise ValueError(
                     f"expects value to be a pointer for {field}, but got {type(value).__name__}"
                 )
-            value = value.value
+            mlir_operand = cast(Any, value).value
 
         field_name = f"#cute_nvgpu.atom_mma_field_sm120_block_scaled<{field._to_ir_field_name()}>"
         attr = ir.Attribute.parse(field_name)
         self.value = _cute_nvgpu_ir.atom_set_value(
-            self.value, attr, value, loc=loc, ip=ip
+            self.value, attr, mlir_operand, loc=loc, ip=ip
         )
 
     def get(
@@ -376,6 +472,7 @@ class MmaBlockScaledTrait(Trait):
         loc: Optional[ir.Location] = None,
         ip: Optional[ir.InsertionPoint] = None,
     ) -> Any:
+        # SM120 warp-level block-scaled MMA does not support get method for any field
         raise ValueError(f"the get method for {field} is not supported")
 
 
@@ -394,6 +491,29 @@ class MmaMXF4Op(MmaSM120BlockScaledOp):
     .kind           = {.kind::mxf4};
     .scale_vec_size = {.scale_vec::2X};
     .stype          = {.ue8m0};
+
+    **Supported data type combinations:**
+
+    +-------------+-------------+--------------+----------+-----------+-------------+
+    | A Data Type | B Data Type | SF Data Type | Acc Type | Mma-MNK   | SF Vec Size |
+    +=============+=============+==============+==========+===========+=============+
+    | E2M1        | E2M1        | UE8M0        | F32      | (16,8,64) | 32          |
+    +-------------+-------------+--------------+----------+-----------+-------------+
+
+    **Supported architectures:** sm_120a, sm_120f, sm_121a, sm_121f
+    **Constraints:**
+
+    * Operand layout is fixed: A = row-major (K-major), B = col-major (K-major). Transpose is not supported.
+
+    **Execution Model:**
+
+    * Block-scaled WMMA (``mma.sync.aligned`` with ``.block_scale``) is a warp-collective synchronous
+      operation. All lanes in the warp must execute the same MMA instruction in convergence.
+    * In user code, ``cute.gemm(...)`` should be issued as warp-uniform code.
+
+    .. code-block:: python
+
+        cute.gemm(mma_atom, d, a, b, c)
     """
 
     descriptive_name = "warp-level MXF4 MMA Operation"
@@ -449,8 +569,31 @@ class MmaMXF4NVF4Op(MmaSM120BlockScaledOp):
     See the `PTX documentation <https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-mma>`__.
     This Operation covers the instructions using the ``.e2m1`` qualifiers for the input operands.
     .kind           = {.kind::mxf4nvf4};
-    .scale_vec_size = {.scale_vec::2X, .scale_vec::4X};
-    .stype          = {.ue8m0, .ue4m3};
+    .scale_vec_size = {.scale_vec::4X};
+    .stype          = {.ue4m3};
+
+    **Supported data type combinations:**
+
+    +-------------+-------------+--------------+----------+-----------+-------------+
+    | A Data Type | B Data Type | SF Data Type | Acc Type | Mma-MNK   | SF Vec Size |
+    +=============+=============+==============+==========+===========+=============+
+    | E2M1        | E2M1        | UE4M3        | F32      | (16,8,64) | 16          |
+    +-------------+-------------+--------------+----------+-----------+-------------+
+
+    **Supported architectures:** sm_120a, sm_120f, sm_121a, sm_121f
+    **Constraints:**
+
+    * Operand layout is fixed: A = row-major (K-major), B = col-major (K-major). Transpose is not supported.
+
+    **Execution Model:**
+
+    * Block-scaled WMMA (``mma.sync.aligned`` with ``.block_scale``) is a warp-collective synchronous
+      operation. All lanes in the warp must execute the same MMA instruction in convergence.
+    * In user code, ``cute.gemm(...)`` should be issued as warp-uniform code.
+
+    .. code-block:: python
+
+        cute.gemm(mma_atom, d, a, b, c)
     """
 
     descriptive_name = "warp-level MXF4NVF4 MMA Operation"
@@ -595,56 +738,51 @@ class MmaMXF8F6F4Op(MmaOp):
     use_sf_layout_TV = False
 
     admissible_archs = [
-        Arch.sm_120a,
-        Arch.sm_121a,
+        base_dsl.Arch.sm_120a,
+        base_dsl.Arch.sm_120f,
+        base_dsl.Arch.sm_121a,
+        base_dsl.Arch.sm_121f,
     ]
 
     def __post_init__(self) -> None:
         # Verify arch
         arch = BaseDSL._get_dsl().get_arch_enum()
         if arch not in self.admissible_archs:
-            raise OpError(
-                self,
+            raise DSLUserCodeError(
                 f"expects arch to be one of {self.admissible_archs}, but got {arch}",
                 suggestion="Ensure env CUTE_DSL_ARCH matches your GPU architecture",
             )
         if self.acc_dtype != Float32:
-            raise OpError(
-                self,
+            raise DSLUserCodeError(
                 "expects the 'acc_dtype' Op parameter to be Float32",
             )
         if self.sf_type != Float8E8M0FNU:
-            raise OpError(
-                self,
+            raise DSLUserCodeError(
                 "expects the 'sf_type' Op parameter to be Float8E8M0FNU",
             )
         # Reject same-dtype pairs explicitly (route to dedicated ops).
         if self.a_dtype == self.b_dtype:
             if self.a_dtype == Float4E2M1FN:
-                raise OpError(
-                    self,
+                raise DSLUserCodeError(
                     "same-dtype Float4E2M1FN/Float4E2M1FN is not supported by MmaMXF8F6F4Op; "
                     "use MmaMXF4Op (sf_vec_size=32) or MmaMXF4NVF4Op (sf_vec_size=16) instead",
                 )
             if self.a_dtype in (Float8E4M3FN, Float8E5M2):
-                raise OpError(
-                    self,
+                raise DSLUserCodeError(
                     "same-dtype FP8/FP8 is not supported by MmaMXF8F6F4Op; "
                     "use MmaMXF8Op instead",
                 )
         # Reject same-width mixed-FP8 (E4M3 + E5M2) explicitly.
         fp8_dtypes = (Float8E4M3FN, Float8E5M2)
         if self.a_dtype in fp8_dtypes and self.b_dtype in fp8_dtypes:
-            raise OpError(
-                self,
+            raise DSLUserCodeError(
                 "same-width mixed-FP8 (Float8E4M3FN + Float8E5M2) is not supported; "
                 "supported MXF8F6F4 pairs are (Float4E2M1FN x Float8E4M3FN/Float8E5M2) "
                 "and the reverse",
             )
         # Final allow-list check (catches FP6 and any other unsupported dtype).
         if (self.a_dtype, self.b_dtype) not in MXF8F6F4_SUPPORTED_PAIRS:
-            raise OpError(
-                self,
+            raise DSLUserCodeError(
                 f"unsupported (a_dtype, b_dtype) = ({self.a_dtype}, {self.b_dtype}) "
                 f"for MmaMXF8F6F4Op; supported pairs are "
                 f"{sorted(repr(p) for p in MXF8F6F4_SUPPORTED_PAIRS)}. "
