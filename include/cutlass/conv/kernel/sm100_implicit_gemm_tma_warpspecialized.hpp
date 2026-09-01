@@ -581,7 +581,7 @@ public:
         auto k_tile_count = scheduler.get_work_k_tile_count(work_tile_info, problem_shape_MNKL, TileShape{});
         auto k_tile_prologue = min(MainloopPipeline::Stages, k_tile_count);
 
-        auto [mainloop_producer_state_next, k_tile_iter_next] = collective_mainloop.load(
+        auto [mainloop_producer_state_next, k_tile_iter_next] = collective_mainloop.load(//liangjd sm100 conv load
           params.mainloop,
           mainloop_pipeline,
           mainloop_pipe_producer_state,
@@ -697,7 +697,7 @@ public:
         accumulators.data() = tmem_stage_ptrs[acc_stage];
 
         if (is_mma_leader_cta) {
-          mainloop_pipe_consumer_state = collective_mainloop.mma(
+          mainloop_pipe_consumer_state = collective_mainloop.mma(//liangjd sm100 conv mma
             mainloop_pipeline,
             mainloop_pipe_consumer_state,
             accumulators,

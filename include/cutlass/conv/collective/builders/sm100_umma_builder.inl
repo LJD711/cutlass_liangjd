@@ -60,7 +60,7 @@ template <
 >
 struct CollectiveBuilder<
     ArchTag,
-    arch::OpClassTensorOp,
+    arch::OpClassTensorOp,//固定类型不需要推导
     ConvOp,
     ElementA,
     GmemLayoutA,
@@ -84,6 +84,7 @@ struct CollectiveBuilder<
        cute::is_same_v<KernelScheduleType, KernelScheduleAuto>) &&
       ((sizeof(ElementA) * AlignmentA) % cutlass::gemm::collective::detail::tma_alignment_bytes == 0) &&
       ((sizeof(ElementB) * AlignmentB) % cutlass::gemm::collective::detail::tma_alignment_bytes == 0)>> {
+      //只有条件成立时，enable_if_t<条件> 才是有效类型，特化才能参与匹配。
 private:
   // For fprop, majorA = K,  major B = K;
   // For wgrad, majorA = MN, major B = MN;
@@ -94,11 +95,11 @@ private:
     (ConvOp == conv::Operator::kFprop) ? cute::UMMA::Major::K : cute::UMMA::Major::MN;
 
   // For fp32 types, map to tf32 MMA value type
-  using ElementAMma = cute::conditional_t<cute::is_same_v<ElementA, float>, tfloat32_t, ElementA>;
-  using ElementBMma = cute::conditional_t<cute::is_same_v<ElementB, float>, tfloat32_t, ElementB>;
+  using ElementAMma = cute::conditional_t<cute::is_same_v<ElementA, float>, tfloat32_t, ElementA>;//half
+  using ElementBMma = cute::conditional_t<cute::is_same_v<ElementB, float>, tfloat32_t, ElementB>;//half
 
-  using TileShape_MNK = decltype(cute::take<0,3>(TileShape_MNKL{})); // (MmaAtomShapeM, MmaAtomShapeN, TileK)
-
+  using TileShape_MNK = decltype(cute::take<0,3>(TileShape_MNKL{})); // (MmaAtomShapeM, MmaAtomShapeN, TileK) Shape<_64, _64, Shape<_64>>
+  //这里的第三项 Shape<_64> 不是普通的 _64，表示 K 维本身是一个嵌套 shape；take<0, 3> 只裁剪最外层，不会把嵌套的 Shape<_64> 展平
   static constexpr auto
   get_tiled_mma_schedule() {
     if constexpr (cute::is_same_v<KernelScheduleType, KernelStridedDgradTmaWs1SmSm100>) {

@@ -314,7 +314,7 @@ public:
       }
 
       void* kernel_params[] = {&params};
-      if constexpr (kEnableCudaHostAdapter) {
+      if constexpr (kEnableCudaHostAdapter) {//liangjd sm100 conv 默认false
         //
         // Use the cuda host adapter
         //
@@ -334,7 +334,7 @@ public:
           return Status::kErrorInternal;
         }
       }
-      else {
+      else {//liangjd sm100 conv
         CUTLASS_ASSERT(cuda_adapter == nullptr);
         void const* kernel = (void const*) device_kernel<ConvKernel>;
         if constexpr (ConvKernel::ArchTag::kMinComputeCapability == 90
