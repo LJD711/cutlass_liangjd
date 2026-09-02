@@ -158,51 +158,76 @@ private:
   }
 
   // For wgrad kernel, tensor A uses tma tiled mode and tensor B uses tma im2col mode.
-  using GmemTiledCopyA = decltype(get_tma_atom_A());
+  using GmemTiledCopyA = decltype(get_tma_atom_A());//返回 TMA_copy_atom_op，后续需要make_tma_copy
   using GmemTiledCopyB = decltype(get_tma_atom_B());
 
   using BlockTileA_M = decltype(cute::size<0,0>(MmaShapeA_MK{}) * cute::size<1>(MmaShapeA_MK{}));
   using BlockTileA_K = decltype(cute::size<0,1>(MmaShapeA_MK{}) * cute::size<2>(MmaShapeA_MK{}));
   using SmemLayoutAtomA = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<
-      UmmaMajorA, ElementAMma, BlockTileA_M, BlockTileA_K>());
+      UmmaMajorA, ElementAMma, BlockTileA_M, BlockTileA_K>());//记录SMEM中A矩阵的布局，主要是为了后续的TMA_LOAD和UMMA操作
 
   using BlockTileB_N = decltype(cute::size<0,0>(MmaShapeB_NK{}) * cute::size<1>(MmaShapeB_NK{}));
   using BlockTileB_K = decltype(cute::size<0,1>(MmaShapeB_NK{}) * cute::size<2>(MmaShapeB_NK{}));
   using SmemLayoutAtomB = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<
       UmmaMajorB, ElementBMma, BlockTileB_N, BlockTileB_K>());
 
-  // Calculate SMEM matrix A and B buffers' pipeline stages
+  // 下面先统计 kernel 中除 mainloop A/B 多级缓冲和 epilogue tensor storage 之外的固定 SMEM 开销，
+  // 再用架构可用 SMEM 减去这些开销，推导 mainloop 能容纳多少级 A/B tile。
+
+  // UMMA warp（producer）与 epilogue warp（consumer）通过该 pipeline 交接 TMEM 中的累加器 tile。
+  // 固定使用双缓冲，使 UMMA 可以生产下一块累加器，同时 epilogue 消费上一块。
   static constexpr uint32_t AccumulatorPipelineStageCount = 2;
+
+  // CLC（Cluster Launch Control）调度器结果的 pipeline 深度；这里一次只缓存一个调度结果。
   static constexpr uint32_t SchedulerPipelineStageCount = 1;
+
+  // 一个 tile scheduler CLCResponse 的大小（byte）；当前 SM100 implicit-GEMM scheduler 的响应为 16B。
   static constexpr uint32_t CLCResponseSize = 16;
 
-  // AccumulatorPipeline = PipelineUmmaAsync
+  // 累加器 pipeline 每一级使用 full/empty barrier；这里只统计其 SharedStorage（不包含 TMEM 数据本身）。
   static constexpr auto AccumulatorPipelineStorage = sizeof(typename cutlass::PipelineUmmaAsync<AccumulatorPipelineStageCount>::SharedStorage);
-  // CLCPipeline = PipelineCLCFetchAsync
+
+  // CLC fetch pipeline 的共享存储，每一级包含用于调度结果交接的 full/empty cluster barrier。
   static constexpr auto CLCPipelineStorage = sizeof(typename cutlass::PipelineCLCFetchAsync<SchedulerPipelineStageCount, ClusterShape_MNK>::SharedStorage);
-  // LoadOrderBarrier = OrderedSequenceBarrier<1,2>
+
+  // 用于约束 mainloop load 与 epilogue load 两个 warp-group 执行顺序的 barrier 存储：
+  // sequence depth = 1，length = 2。
   static constexpr auto LoadOrderBarrierStorage = sizeof(typename cutlass::OrderedSequenceBarrier<1,2>::SharedStorage);
-  // CLC (scheduler) response
+
+  // 保存 scheduler 返回的 CLCResponse；每个 scheduler pipeline stage 对应一个响应槽位。
   static constexpr auto CLCResponseStorage = SchedulerPipelineStageCount * CLCResponseSize;
-  // Tmem dealloc
+
+  // 释放 TMEM 前用于 cluster 内同步的 barrier。
   static constexpr auto TmemDeallocStorage = sizeof(cutlass::arch::ClusterBarrier);
-  // Tmem ptr storage
+
+  // 保存 TMEM 分配结果（base pointer）；每个槽位使用一个 32-bit TMEM 地址。
   static constexpr auto TmemBasePtrsStorage = SchedulerPipelineStageCount * sizeof(uint32_t);
-  // Smem usage that's not part of CollectiveEpilogue::SharedStorage & CollectiveMainloop::SharedStorage
+
+  // 汇总 kernel 级固定 SMEM 开销。CollectiveMainloop/CollectiveEpilogue 自己的 SharedStorage 不在这里重复计算。
   static constexpr auto KernelSmemCarveout = static_cast<int>( AccumulatorPipelineStorage +
                                                                CLCPipelineStorage +
                                                                LoadOrderBarrierStorage +
                                                                TmemDeallocStorage +
                                                                CLCResponseStorage +
                                                                TmemBasePtrsStorage);
-  // Reduce SMEM capacity available for buffers considering barrier allocations.
+
+  // 从当前架构的 SMEM 总容量中扣除上述 kernel 固定开销，得到可供 collective 使用的容量。
   static constexpr int ReducedSmemCapacityBytes = detail::sm100_reduced_smem_capacity_bytes<ArchTag, KernelSmemCarveout>();
 
+  // 一层 mainloop SMEM 缓冲所覆盖的逻辑 tile：(A 的 M, B 的 N, 公共 K)。
+  // 单级容量由 A 的 M*K 个元素与 B 的 N*K 个元素组成；helper 使用 sizeof_bits_v 和
+  // bits_to_bytes 计算实际字节数，因此也能正确处理 sub-byte 类型。
   using SmemTileShape = cute::Shape<BlockTileA_M, BlockTileB_N, BlockTileA_K>;
 
+  // 决定 A/B mainloop pipeline 的 stage 数：
+  //   * StageCountType 显式给出 stage 数时，直接使用该值；
+  //   * 使用自动模式时，以 ReducedSmemCapacityBytes（还会扣除 StageCountType 指定的 carveout）
+  //     除以每一级 A/B tile 加 pipeline barrier 的字节数，得到最多可容纳的 stage 数。
   static constexpr int PipelineStages = detail::compute_stage_count_or_override<
       ReducedSmemCapacityBytes, ElementAMma, ElementBMma, SmemTileShape>(StageCountType{});
 
+  // 根据全局内存 layout tag 推导卷积空间维数：TensorNWC/NHWC/NDHWC 分别对应 1D/2D/3D。
+  // helper 同时要求 A、B 使用相同的 layout tag。
   constexpr static int NumSpatialDimensions = detail::gmem_layout_tags_to_spatial_dims<GmemLayoutA, GmemLayoutB>();
 
   using DispatchPolicy = cutlass::conv::MainloopSm100TmaUmmaWarpSpecializedImplicitGemm<

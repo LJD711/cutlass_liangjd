@@ -2,26 +2,51 @@
   "version": 4,
   "configurations": [
     {
-      "name": "CUTLASS local",
+      "name": "Win32",
       "includePath": [
         "${workspaceFolder}/include",
         "${workspaceFolder}/tools/util/include",
         "${workspaceFolder}/tools/library/include",
         "${workspaceFolder}/tools/profiler/include",
         "${workspaceFolder}/examples",
-        "${workspaceFolder}/test"
+        "${workspaceFolder}/test",
+        "${workspaceFolder}/operators",
+        "${workspaceFolder}/cutlass_compiler/base/include",
+        "${workspaceFolder}/cutlass_compiler/cutegen/include",
+        "${workspaceFolder}/cutlass_compiler/cute_ir/include"
       ],
       "browse": {
         "path": [
-          "${workspaceFolder}/include",
-          "${workspaceFolder}/tools/util/include",
-          "${workspaceFolder}/tools/library/include",
-          "${workspaceFolder}/tools/profiler/include",
-          "${workspaceFolder}/examples",
-          "${workspaceFolder}/test"
+          "${workspaceFolder}"
         ],
         "limitSymbolsToIncludedHeaders": false
       },
+      "compilerPath": "",
+      "cppStandard": "c++17",
+      "cStandard": "c17",
+      "intelliSenseMode": "windows-msvc-x64"
+    },
+    {
+      "name": "Linux",
+      "includePath": [
+        "${workspaceFolder}/include",
+        "${workspaceFolder}/tools/util/include",
+        "${workspaceFolder}/tools/library/include",
+        "${workspaceFolder}/tools/profiler/include",
+        "${workspaceFolder}/examples",
+        "${workspaceFolder}/test",
+        "${workspaceFolder}/operators",
+        "${workspaceFolder}/cutlass_compiler/base/include",
+        "${workspaceFolder}/cutlass_compiler/cutegen/include",
+        "${workspaceFolder}/cutlass_compiler/cute_ir/include"
+      ],
+      "browse": {
+        "path": [
+          "${workspaceFolder}"
+        ],
+        "limitSymbolsToIncludedHeaders": false
+      },
+      "compilerPath": "/usr/bin/g++",
       "cppStandard": "c++17",
       "cStandard": "c17",
       "intelliSenseMode": "linux-gcc-x64"
