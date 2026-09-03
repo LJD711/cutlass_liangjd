@@ -1007,7 +1007,7 @@ namespace PipelineDetail {
     using EmptyBarrier = cutlass::arch::ClusterBarrier;
 
     FullBarrier full_barrier_[Stages];
-    EmptyBarrier empty_barrier_[Stages];
+    EmptyBarrier empty_barrier_[Stages];//可以理解为SMEM中的Mbarrier，读和写分别需要两个barrier，full_barrier_是生产者的barrier，empty_barrier_是消费者的barrier
   };
 };
 

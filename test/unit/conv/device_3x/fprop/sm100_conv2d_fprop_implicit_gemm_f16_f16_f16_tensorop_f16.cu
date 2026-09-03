@@ -139,7 +139,7 @@ TEST(SM100_device_conv2d_fprop_implicitgemm_f16nhwc_f16nhwc_f16nhwc_tensor_op_f1
       ProblemShape,
       CollectiveMainloop,
       CollectiveEpilogue
-    >;
+    >;//sm100_implicit_gemm_tma_warpspecialized.hpp
 
   using Conv = cutlass::conv::device::ConvUniversalAdapter<ConvKernel>;
 

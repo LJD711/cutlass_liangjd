@@ -248,7 +248,7 @@ public:
       TiledMma,
       detail::Sm100ImplicitGemmTileTraits<GmemTiledCopyA, SmemLayoutAtomA>,
       detail::Sm100ImplicitGemmTileTraits<GmemTiledCopyB, SmemLayoutAtomB>
-    >;
+    >;//sm100_implicit_gemm_umma_warpspecialized.hpp
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
