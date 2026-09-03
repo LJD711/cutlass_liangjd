@@ -379,50 +379,76 @@ public:
   // Methods
   //
 
+  // 将 host 侧的卷积问题描述和 A/B 指针降级为 device mainloop 使用的 Params。
+  // 这里最重要的工作是：根据张量形状、步长和 cluster 布局创建 TMA load 描述符。
   static constexpr Params
-  to_underlying_arguments(ProblemShape const& problem_shape, Arguments const& args, void* workspace, cutlass::KernelHardwareInfo const& hw_info = cutlass::KernelHardwareInfo{}) {
+  to_underlying_arguments(
+      ProblemShape const& problem_shape,               // 原始、尚未线性化的卷积问题（形状、步长、padding、dilation 等）。
+      Arguments const& args,                           // 用户传入的 mainloop 参数；当前只包含 A、B 的全局内存指针。
+      void* workspace,                                 // mainloop workspace；此实现不需要使用它。
+      cutlass::KernelHardwareInfo const& hw_info =     // 首选和 fallback 的运行时 cluster shape 等硬件信息。
+          cutlass::KernelHardwareInfo{}) {
+    // 当前 collective 不使用 workspace；显式转为 void 以消除未使用参数警告。
     (void) workspace;
 
-    // from the flat problem shape arrays of ConvProblemShape<N>, create a rank-3 MNK problem shape tuple
-    // tma desc creation depends on the original untransformed domain.
-
-    // A extents.
+    // TMA descriptor 必须基于卷积原始坐标域创建，不能使用之后转换得到的 MNKL 线性化形状。
+    // 从 ProblemShape 中取得张量 A 的原始逻辑 extent；Fprop 下通常对应 activation 的 NHWC 形状。
     auto shape_A_orig = problem_shape.get_shape_A();
-    // B extents.
+    // 从 ProblemShape 中取得张量 B 的原始逻辑 extent；Fprop 下通常对应 filter 的 KRSC 形状。
     auto shape_B_orig = problem_shape.get_shape_B();
 
-    // Fill inferred cute strides from flat stride arrays
+    // 将用户保存于扁平数组中的 A stride，转换成与 StrideA 类型结构一致的 CuTe 分层 stride。
     auto dA = make_cute_packed_stride(StrideA{}, problem_shape.stride_A, ConvOp);
+    // 将用户保存于扁平数组中的 B stride，转换成与 StrideB 类型结构一致的 CuTe 分层 stride。
     auto dB = make_cute_packed_stride(StrideB{}, problem_shape.stride_B, ConvOp);
 
+    // 将 A 指针重解释为 TMA descriptor 使用的内部元素类型；这里只改变指针类型，不搬运或转换数据。
     auto ptr_A = recast_ptr<TmaInternalElementA>(args.ptr_A);
+    // 将 B 指针重解释为 TMA descriptor 使用的内部元素类型；float 输入会用 TF32，其余类型保持相同位宽。
     auto ptr_B = recast_ptr<TmaInternalElementB>(args.ptr_B);
 
+    // 用 A 的全局内存指针、原始 extent 和 CuTe stride 组成一个描述全局内存视图的 CuTe Tensor。
     Tensor tensor_a = make_tensor(make_gmem_ptr(ptr_A), make_layout(shape_A_orig, dA));
+    // 用 B 的全局内存指针、原始 extent 和 CuTe stride 组成一个描述全局内存视图的 CuTe Tensor。
     Tensor tensor_b = make_tensor(make_gmem_ptr(ptr_B), make_layout(shape_B_orig, dB));
 
+    // 选择首选 cluster shape：静态 ClusterShape 直接生效；动态 ClusterShape 才采用 hw_info 中的运行时值。
     auto cluster_shape = cutlass::detail::select_cluster_shape(ClusterShape{}, hw_info.cluster_shape);
-    // Cluster layout for TMA construction
-    auto cluster_layout_vmnk = tiled_divide(make_layout(cluster_shape), make_tile(typename TiledMma::AtomThrID{}));
-    auto cluster_shape_fallback = cutlass::detail::select_cluster_shape(ClusterShape{}, hw_info.cluster_shape_fallback);
+    // 将首选 cluster layout 按 TiledMma 的 AtomThrID tile 分块，得到 TMA 构造所需的 VMNK 参与者布局。
+    auto cluster_layout_vmnk =
+        tiled_divide(make_layout(cluster_shape), make_tile(typename TiledMma::AtomThrID{}));
+    // 同理选择备用 cluster shape，供动态 cluster 首选形状无法启动时使用。
+    auto cluster_shape_fallback =
+        cutlass::detail::select_cluster_shape(ClusterShape{}, hw_info.cluster_shape_fallback);
 
-    // Cluster layout for TMA construction
-    auto cluster_layout_vmnk_fallback = tiled_divide(make_layout(cluster_shape_fallback), make_tile(typename TiledMma::AtomThrID{}));
+    // 为备用 cluster 构造 VMNK 参与者布局；它决定 fallback 路径中的 TMA multicast 分发方式。
+    auto cluster_layout_vmnk_fallback =
+        tiled_divide(make_layout(cluster_shape_fallback), make_tile(typename TiledMma::AtomThrID{}));
 
+    // 根据 A tensor、卷积参数和首选 cluster 布局创建 A 的 TMA load atom/descriptor。
+    // Fprop 的 A 通常走 TMA im2col，Wgrad 或 strided Dgrad 的 A 可走普通 tiled TMA。
     auto tma_load_a = get_tma_load_a_instance(tensor_a, problem_shape, cluster_layout_vmnk);
+    // 根据 B tensor、卷积参数和首选 cluster 布局创建 B 的 TMA load atom/descriptor。
     auto tma_load_b = get_tma_load_b_instance(tensor_b, problem_shape, cluster_layout_vmnk);
-    auto tma_load_a_fallback = get_tma_load_a_instance(tensor_a, problem_shape, cluster_layout_vmnk_fallback);
-    auto tma_load_b_fallback = get_tma_load_b_instance(tensor_b, problem_shape, cluster_layout_vmnk_fallback);
+    // 用 fallback cluster 布局再创建一份 A 描述符，使运行时切换 cluster 后仍有匹配的 multicast 配置。
+    auto tma_load_a_fallback =
+        get_tma_load_a_instance(tensor_a, problem_shape, cluster_layout_vmnk_fallback);
+    // 用 fallback cluster 布局再创建一份 B 描述符，使运行时切换 cluster 后仍有匹配的 multicast 配置。
+    auto tma_load_b_fallback =
+        get_tma_load_b_instance(tensor_b, problem_shape, cluster_layout_vmnk_fallback);
 
+    // 编译期验证 A 的 TMA 参与者数量与 1SM/2SM MMA 所要求的 AtomThrShapeMNK 一致。
     static_assert(size(typename decltype(tma_load_a)::ThrID{}) == size(AtomThrShapeMNK{}));
+    // 编译期验证 B 的 TMA 参与者数量也与 MMA 的参与 CTA 数量一致。
     static_assert(size(typename decltype(tma_load_b)::ThrID{}) == size(AtomThrShapeMNK{}));
 
+    // 按 Params 成员声明顺序返回 device mainloop 参数；这是聚合初始化，不会再做额外转换。
     return {
-      tma_load_a,
-      tma_load_b,
-      tma_load_a_fallback,
-      tma_load_b_fallback,
-      hw_info.cluster_shape_fallback
+      tma_load_a,                    // Params::tma_load_a：首选 cluster 下的 A TMA 描述符。
+      tma_load_b,                    // Params::tma_load_b：首选 cluster 下的 B TMA 描述符。
+      tma_load_a_fallback,           // Params::tma_load_a_fallback：备用 cluster 下的 A TMA 描述符。
+      tma_load_b_fallback,           // Params::tma_load_b_fallback：备用 cluster 下的 B TMA 描述符。
+      hw_info.cluster_shape_fallback // Params::cluster_shape_fallback：供 device 端识别 fallback cluster。
     };
   }
 

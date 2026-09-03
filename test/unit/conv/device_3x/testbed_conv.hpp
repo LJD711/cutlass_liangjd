@@ -349,7 +349,7 @@ struct ConvTestbed {
       return true;
     }
 
-    bool ret = initialize(problem_shape);
+    bool ret = initialize(problem_shape);//liangjd sm100 conv 初始化随机数
 
     if (!ret) {
       std::cerr << "initialize failed for the given problem_shape: \n";
@@ -444,7 +444,7 @@ struct ConvTestbed {
 
     cutlass::Status status = cutlass::Status::kInvalid;
 
-    status = conv_op.can_implement(args);
+    status = conv_op.can_implement(args);//检查kernel
     EXPECT_EQ(conv_op.can_implement(args), cutlass::Status::kSuccess);
     if (status != cutlass::Status::kSuccess) {
       std::cerr << "can_implement failed for the given problem_shape: \n";
