@@ -392,6 +392,7 @@ struct ConvTestbed {
     }
 
     auto mainloop_args = params.get_mainloop_arguments(problem_shape, tensor_A, tensor_B); 
+    //获得主循环的参数，主要是tensor_A和tensor_B的指针 sm100_implicit_gemm_umma_warpspecialized.hpp struct Arguments 
 
     auto epilogue_args = typename Conv::ConvKernel::EpilogueArguments {
       {},

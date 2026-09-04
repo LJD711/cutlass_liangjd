@@ -212,6 +212,18 @@ private:
   // B since operand A, B is swapped.
   // For strided dgrad A and B are both tma tiled and not im2col
 
+  // 根据 A operand 的 CopyOp，在 host 端构造一个完整的 CuTe TMA copy atom/descriptor。
+  // 注意：本函数只描述“以后怎样从 GMEM 搬到 SMEM”，不会在这里真正发起 TMA copy；
+  // device 端稍后会通过 get_tma_tensor()、tma_partition() 和 copy() 使用返回对象。
+  //
+  // 这个 helper 有两处用途：
+  //   1. Params::TMA_A 中放在 decltype(...) 里，只为了推导返回对象的准确类型；
+  //   2. to_underlying_arguments() 中传入真实指针/shape，分别构造 preferred 和 fallback
+  //      cluster 对应的 descriptor。cluster 布局会影响 A 沿 N 方向的 multicast 范围。
+  //
+  // TensorA 保存 A 的 GMEM 指针、逻辑 shape 和 stride；ClusterShapeVMNK 描述
+  // (CTA_V, CTA_M, CTA_N, CTA_K) 参与者布局。返回类型可能因 im2col/tiled 分支而不同，
+  // 但 is_im2col_A 是编译期常量，if constexpr 只实例化其中一个分支，因此 auto 可以正确推导。
   template <class TensorA, class ClusterShapeVMNK>
   static constexpr auto
   get_tma_load_a_instance(
@@ -219,13 +231,21 @@ private:
     ProblemShape const& problem_shape,
     ClusterShapeVMNK const& cluster_shape_vmnk) {
 
+    // is_im2col_A 由 GmemTiledCopyA 的类型在编译期决定。
+    // Fprop 和 non-strided Dgrad 的 A 需要在搬运时完成 implicit-GEMM 的 im2col 坐标映射。
     if constexpr (is_im2col_A) {
-      // compute the upper and lower corners based on the conv padding
+      // 生成 SM100 TMA im2col descriptor 所需的卷积坐标参数：
+      //   lower/upper_corner_whd：由 padding、filter/output/input 范围推导出的空间近/远端偏移；
+      //   lower_srt：filter 空间坐标的起点。
+      // 这些 helper 会把 ProblemShape 中的空间维顺序反转成硬件描述符使用的 [W,H,D]/[S,R,T]。
+      // 对 Fprop，lower_srt 为 0；对 Dgrad，它从 filter 的远端开始，以配合反向遍历。
       auto lower_corner_whd = detail::compute_lower_corner_whd(problem_shape);
       auto upper_corner_whd = detail::compute_upper_corner_whd(problem_shape);
       auto lower_srt = detail::compute_lower_srt(problem_shape);
 
-      // gbasis strides for dgrad kernel need to be negated
+      // TMA im2col 用 stride_srt 表示 filter 各空间维每前进一步时输入坐标的变化量。
+      // Fprop 使用正 dilation；Dgrad 从 filter 远端向近端遍历，所以 gbasis stride 必须取负。
+      // 下标反转同样是把 ProblemShape 的空间维顺序转换为 [S,R,T] 顺序。
       cute::array<int32_t, NumSpatialDimensions> stride_srt{};
       for (int i = 0; i < NumSpatialDimensions; ++i) {
         stride_srt[i] = ConvOp == conv::Operator::kDgrad ?
@@ -233,6 +253,13 @@ private:
             problem_shape.dilation[NumSpatialDimensions-1-i];
       }
 
+      // 将 GMEM tensor、单个 pipeline stage 的 SMEM layout、UMMA tile/参与 CTA 布局，
+      // 以及完整卷积坐标变换一起编码进 TMA im2col atom：
+      //   GmemTiledCopyA{}                       选择普通/多播以及 1SM/2SM 对应的 TMA CopyOp；
+      //   SmemLayoutA{}(_,_,_,Int<0>{})         取第 0 个 stage 的布局作为每个 stage 共用的目标布局；
+      //   TileShape{} + TiledMma{}               决定 A 的 (M,K) tile 及 UMMA participant 映射；
+      //   cluster_shape_vmnk                     决定多播时同一份 A tile 要送往多少个 N-CTA；
+      //   后面的 corner/padding/stride 参数      定义 implicit im2col 的边界和坐标变换。
       return make_im2col_tma_atom_A_sm100(
           GmemTiledCopyA{},
           tensor_a,
@@ -248,8 +275,14 @@ private:
           shape(lower_srt),
           shape(stride_srt));
     }
-    // TMA tiled mode for tensor A in wgrad and strided dgrad
+    // Wgrad（A/B 的 implicit-GEMM 角色与 Fprop 对调）以及 strided Dgrad 的 A
+    // 不走硬件 im2col，而使用普通 tiled TMA。此时 tensor_a 的 layout/stride 已完整描述
+    // GMEM 寻址，所以无需把 padding、dilation 等 ProblemShape 字段写入 descriptor。
     else {
+      // 显式指定 TmaInternalElementA：float 让 TMA 按设计转换成 TF32，其他类型则换成
+      // 等 bit 宽的无符号类型，以避免搬运阶段发生非预期的数值舍入；
+      // make_tma_atom_A_sm100() 仍会根据 TileShape、TiledMma 和 cluster 布局计算
+      // A 的 (M,K) tile、参与 CTA 映射及沿 N 方向的 multicast 数量。
       return make_tma_atom_A_sm100<TmaInternalElementA>(
           GmemTiledCopyA{},
           tensor_a,
