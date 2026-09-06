@@ -941,7 +941,13 @@ public:
         cute::gemm(tiled_mma, tCrA(_,_,k_block,read_stage), tCrB(_,_,k_block,read_stage), accumulators);
         tiled_mma.accumulate_ = UMMA::ScaleOut::One;
       }
-      pipeline.consumer_release(curr_mainloop_pipe_consumer_state);
+      pipeline.consumer_release(curr_mainloop_pipe_consumer_state);//保护共享内存不被过早覆盖
+      /*
+        Blackwell 并不是没有 commit， 它被融合进了：pipeline.consumer_release(...)
+        把 barrier arrival 提交给此前发出的 UMMA 操作，等这些 UMMA 操作真正完成后，硬件才让 empty barrier 到达。
+        这样 TMA 生产者就不会过早覆盖 UMMA 仍在读取的共享内存。
+      */
+
     }
 
     return mainloop_pipe_consumer_state;
