@@ -398,7 +398,7 @@ public:
       asm volatile(
         "{\n\t"
         "clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128 [%0], [%1];\n\t" 
-        "}\n"
+        "}\n"//CLC 硬件会把同一个 16B response 写到请求方 cluster 中每个 CTA 对应的 shared-memory 地址，并分别完成每个 CTA 本地 full barrier 的 transaction
         :
         : "r"(result_addr), "r"(mbarrier_addr));
   #else
@@ -420,7 +420,7 @@ public:
         "ld.shared.b128 clc_result, [%4];\n\t"
         "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_result;\n\t"
         "selp.u32 %3, 1, 0, p1;\n\t"
-        "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {%0, %1, %2, _}, clc_result;\n\t"
+        "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {%0, %1, %2, _}, clc_result;\n\t"//返回first_ctaid
         "}\n"
         : "=r"(work_tile_info.M_idx), "=r"(work_tile_info.N_idx), "=r"(work_tile_info.L_idx), "=r"(valid)
         : "r"(result_addr)
@@ -438,12 +438,12 @@ public:
   CUTLASS_DEVICE
   PipelineState<Stages> 
   advance_to_next_work(Pipeline& clc_pipeline, PipelineState<Stages> clc_pipe_producer_state) const {
-    uint32_t mbarrier_addr = clc_pipeline.producer_get_barrier(clc_pipe_producer_state);
+    uint32_t mbarrier_addr = clc_pipeline.producer_get_barrier(clc_pipe_producer_state);//获取当前 stage 的 full barrier 地址
     // Wait for clcID buffer to become empty with a flipped phase
     clc_pipeline.producer_acquire(clc_pipe_producer_state);
 
     if (cute::elect_one_sync()) {
-      issue_clc_query(clc_pipe_producer_state, mbarrier_addr, clc_response_ptr_);
+      issue_clc_query(clc_pipe_producer_state, mbarrier_addr, clc_response_ptr_);// 尝试取消一个还没有启动的 cluster； 将取消结果异步写入各 CTA 对应的 clc_response[stage]； response 到达后，由硬件完成 CLC full barrier 的 transaction bytes。
     }
 
     ++clc_pipe_producer_state;
@@ -458,8 +458,8 @@ public:
     WorkTileInfo work_tile_info,
     TileSchedulerPipeline& scheduler_pipeline,
     TileSchedulerPipelineState scheduler_pipe_consumer_state) {
-
-    scheduler_pipeline.consumer_wait(scheduler_pipe_consumer_state);
+    //从整个 cluster 看：各 CTA 的参与线程最终都会调用 consumer_wait()，因此所有 CTA 的本地 barrier 都有人等待/检查
+    scheduler_pipeline.consumer_wait(scheduler_pipe_consumer_state);//这行代码是不同CTA进行调用的，等待当前 stage 的 full barrier。只有 CLC response 的 16 bytes 完成后才能继续。
     uint32_t smem_addr = cute::cast_smem_ptr_to_uint(&clc_response_ptr_[scheduler_pipe_consumer_state.index()]);
     auto work_tile = work_tile_info_from_clc_response(smem_addr);
     scheduler_pipeline.consumer_release(scheduler_pipe_consumer_state);

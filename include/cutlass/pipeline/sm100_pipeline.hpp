@@ -531,20 +531,20 @@ private:
 // the result of MMA instructions.
 template <
   int Stages_,
-  class ClusterShape = Shape<int,int,_1>,
-  class AtomThrShape_MNK_ = Shape<_1,_1,_1>
+  class ClusterShape = Shape<int,int,_1>,//CTA cluster 的 (M,N,K) 形状，可为静态或动态 shape
+  class AtomThrShape_MNK_ = Shape<_1,_1,_1>//一条 UMMA 操作需要几个 CTA 共同参与 
 >
-class PipelineTmaUmmaAsync {
+class PipelineTmaUmmaAsync {//TMA是生产者 UMMA是消费者，TMA搬运数据到共享内存，UMMA从共享内存读取数据进行计算
 public:
   static constexpr uint32_t Stages = Stages_;
   using AtomThrShape_MNK = AtomThrShape_MNK_;
 private:
-  using Impl = PipelineTmaAsync<Stages>;
+  using Impl = PipelineTmaAsync<Stages>;//转发sm90_pipeline.hpp中的PipelineTmaAsync
 public:
-  using FullBarrier  = typename Impl::FullBarrier;
-  using EmptyBarrier = typename Impl::EmptyBarrier;
-  using ProducerBarrierType = typename Impl::ProducerBarrierType;
-  using ConsumerBarrierType = typename Impl::ConsumerBarrierType;
+  using FullBarrier  = typename Impl::FullBarrier;//这是支持 transaction byte count 的 mbarrier。Producer 执行
+  using EmptyBarrier = typename Impl::EmptyBarrier;//它不统计传输字节，只统计 arrival。所有相关 UMMA consumer 完成读取后，对它执行 arrival。
+  using ProducerBarrierType = typename Impl::ProducerBarrierType;//uint64_t
+  using ConsumerBarrierType = typename Impl::ConsumerBarrierType;//uint64_t
   using PipelineState = typename Impl::PipelineState;
   using SharedStorage = typename Impl::SharedStorage;
   using ThreadCategory = typename Impl::ThreadCategory;
@@ -738,6 +738,7 @@ private:
   // Ensures all blocks in the Same Row and Column get notifed.
   CUTLASS_DEVICE
   void consumer_release(uint32_t stage, uint32_t skip) {
+  //把此前发出的异步 tcgen05.mma 与 empty_barrier 关联；等这些 UMMA 真正完成并不再读取 SMEM 后，再由硬件完成 barrier arrive。
     detail::pipeline_check_is_consumer(params_.role);
     uint64_t* smem_ptr = reinterpret_cast<uint64_t*>(&empty_barrier_ptr_[stage]);
     if constexpr (is_2sm_mma) { // Mma cluster shape is 2x1
@@ -931,6 +932,7 @@ struct PipelineCLCFetchAsyncSharedStorage {
 
 } // namespace PipelineDetail
 
+//CLCPipe
 template <int Stages_, class ClusterShape = Shape<int,int,_1>>
 class PipelineCLCFetchAsync {
 
@@ -1098,9 +1100,10 @@ private:
     // 2. Set the transaction bytes set to occur on the Full barrier for all blocks
     if (barrier_token == BarrierStatus::WaitAgain) {
       empty_barrier_ptr_[stage].wait(phase);
-    }
+    }//等待 empty_barrier[stage]
 
     full_barrier_ptr_[stage].arrive_and_expect_tx(params_.transaction_bytes, lane_idx_, uint32_t(lane_idx_ < cluster_size_));
+    //设置 full_barrier[stage] 的 expected transaction bytes，由一个CTA的线程 lane_idx_ 负责设置，其他线程不设置。
   }
 
   CUTLASS_DEVICE

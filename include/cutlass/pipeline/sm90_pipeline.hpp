@@ -172,9 +172,9 @@ struct PipelineState {
 
   static constexpr uint32_t Stages = Stages_;
 
-  int index_ = 0;
-  uint32_t phase_ = 0;
-  uint32_t count_ = 0;
+  int index_ = 0;//当前 stage 下标
+  uint32_t phase_ = 0;//barrier phase/parity
+  uint32_t count_ = 0;//已经前进的总次数
 
   CUTLASS_DEVICE
   PipelineState(): index_{}, phase_{}, count_{} {}
@@ -251,7 +251,7 @@ struct PipelineState {
 
 template<class Pipeline>
 CUTLASS_DEVICE
-PipelineState<Pipeline::Stages> make_producer_start_state() {
+PipelineState<Pipeline::Stages> make_producer_start_state() {//初始化barrier状态，producer从1开始，consumer从0开始
   // Producer starts with an opposite phase as the buffers are initially empty
   constexpr int InitialProducerStage = 0;
   constexpr uint32_t InitialProducerPhase = 1;
@@ -272,14 +272,14 @@ class PipelineTmaAsync {
 public:
   using FullBarrier = cutlass::arch::ClusterTransactionBarrier;
   using EmptyBarrier = cutlass::arch::ClusterBarrier;
-  using ProducerBarrierType = FullBarrier::ValueType;
+  using ProducerBarrierType = FullBarrier::ValueType;//uint64_t
   using ConsumerBarrierType = EmptyBarrier::ValueType;
   static constexpr uint32_t Stages = Stages_;
   using PipelineState = cutlass::PipelineState<Stages>;
 
   struct SharedStorage {
-    FullBarrier full_barrier_[Stages];
-    EmptyBarrier empty_barrier_[Stages];
+    FullBarrier full_barrier_[Stages];//某个stage的TMA数据已经到齐
+    EmptyBarrier empty_barrier_[Stages];//表示某个stage的UMMA数据已经消费完毕
   };
 
   enum class ThreadCategory {
@@ -290,7 +290,7 @@ public:
   };
 
   struct Params {
-    uint32_t transaction_bytes = 0;
+    uint32_t transaction_bytes = 0;//每个 stage 期望完成的 TMA 字节数
     ThreadCategory role = ThreadCategory::NonParticipant;
     uint32_t is_leader = 0;
     uint32_t num_consumers = 0; // Number of consumer threads
@@ -1177,7 +1177,7 @@ private:
     if (skip_wait) {
       return {BarrierStatus::WaitDone};
     }
-    bool barrier_status = empty_barrier_ptr_[stage].try_wait(phase);
+    bool barrier_status = empty_barrier_ptr_[stage].try_wait(phase);//检查的是empty_barrier
     return {static_cast<BarrierStatus>(barrier_status)};
   }
 

@@ -599,7 +599,7 @@ struct ClusterTransactionBarrier : public ClusterBarrier {
 #else
     CUTLASS_NOT_IMPLEMENTED();
 #endif
-  }
+  }//producer 在 full_barrier 上 arrive 。告诉 barrier：本轮还需要等待多少字节的 TMA transaction。
 
   // Performs an arrive operation + expected transaction bytes increment for a remote cta_id in a Cluster
   CUTLASS_HOST_DEVICE
@@ -612,8 +612,8 @@ struct ClusterTransactionBarrier : public ClusterBarrier {
         ".reg .pred p;\n\t"
         ".reg .b32 remAddr32;\n\t"
         "setp.eq.u32 p, %2, 1;\n\t"
-        "@p mapa.shared::cluster.u32  remAddr32, %0, %1;\n\t"
-        "@p mbarrier.arrive.expect_tx.shared::cluster.b64  _, [remAddr32], %3;\n\t"
+        "@p mapa.shared::cluster.u32  remAddr32, %0, %1;\n\t"//把本地CTA的smem地址映射到远程CTA的smem地址
+        "@p mbarrier.arrive.expect_tx.shared::cluster.b64  _, [remAddr32], %3;\n\t"//Producer 提前执行：producer arrival 完成但还需要等待 16B transaction
         "}"
         :
         : "r"(smem_addr), "r"(cta_id), "r"(pred), "r"(transaction_bytes)

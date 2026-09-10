@@ -399,7 +399,7 @@ public:
     int warp_idx = canonical_warp_idx_sync();
     WarpCategory warp_category = warp_idx < static_cast<int>(WarpCategory::Epilogue) ? WarpCategory(warp_idx)
                                                                                      : WarpCategory::Epilogue;
-
+    //每个warp都有一个角色
     uint32_t lane_predicate = cute::elect_one_sync();
     auto cluster_shape = cutlass::detail::select_cluster_shape(ClusterShape{});
     int cluster_size = size(cluster_shape);
@@ -446,7 +446,7 @@ public:
     mainloop_pipeline_params.is_leader = lane_predicate && is_mma_leader_cta && is_participant.main_load;
     mainloop_pipeline_params.transaction_bytes = CollectiveMainloop::TmaTransactionBytes;
     mainloop_pipeline_params.initializing_warp = 0;
-    MainloopPipeline mainloop_pipeline(shared_storage.pipelines.mainloop,
+    MainloopPipeline mainloop_pipeline(shared_storage.pipelines.mainloop,//
                                        mainloop_pipeline_params,
                                        cluster_shape,
                                        cute::true_type{},   // Perform barrier init
@@ -559,6 +559,7 @@ public:
 
     // TileID scheduler
     TileScheduler scheduler(&shared_storage.clc_response[0], params.scheduler, problem_shape_MNKL, TileShape{}, block_id_in_cluster);
+    //sm100_tile_scheduler.hpp 59
     typename TileScheduler::WorkTileInfo work_tile_info = scheduler.initial_work_tile_info(cluster_shape);
     auto cta_coord_mnkl = scheduler.work_tile_to_cta_coord(work_tile_info);
     auto acc_shape = collective_mainloop.partition_accumulator_shape();
@@ -624,7 +625,7 @@ public:
 
     }
 
-    else if (is_participant.sched) {
+    else if (is_participant.sched) {//只有CTA leader的sched warp才会进入这个分支
       // Whether a new CLC query must be performed.
       // See comment below where this variable is updated for a description of
       // why this variable is needed.
@@ -634,7 +635,7 @@ public:
         if (requires_clc_query) {
           // Query next clcID and update producer state
           clc_pipe_producer_state = scheduler.advance_to_next_work(clc_pipeline, clc_pipe_producer_state);
-        }
+        }//发出下一次 work 查询 ，并推进 CLC producer ring state
 
         // Fetch next work tile
         auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(
@@ -675,7 +676,7 @@ public:
 
       do {
         auto k_tile_count = scheduler.get_work_k_tile_count(work_tile_info, problem_shape_MNKL, TileShape{});
-
+        //stream-k下 决定本轮mma从哪个Ktile开始计算
         // Fetch next work tile
         auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(
           work_tile_info,

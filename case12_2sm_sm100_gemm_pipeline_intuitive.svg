@@ -1,0 +1,289 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2500" height="1550" viewBox="0 0 2500 1550">
+  <title>Case12 SM100 2SM Conv2d — five pipeline dependency diagram</title>
+  <desc>Simplified diagram retaining CLC, mainloop, accumulator, epilogue-load and epilogue-store pipelines with key PTX.</desc>
+  <rect width="2500" height="1550" fill="#f7f8fa"/>
+
+  <style>
+    text { font-family: "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; fill: #17202a; }
+    .title { font-size: 29px; font-weight: 700; }
+    .sub { font-size: 14px; fill: #47596a; }
+    .section-title { font-size: 18px; font-weight: 700; }
+    .section-sub { font-size: 12px; fill: #536474; }
+    .box-title { font-size: 14.5px; font-weight: 700; }
+    .body { font-size: 12.5px; }
+    .small { font-size: 11.5px; }
+    .tiny { font-size: 10.5px; }
+    .mono { font-family: Menlo, Consolas, "Courier New", monospace; font-size: 10.5px; }
+    .step { font-size: 12px; font-weight: 700; fill: #fff; }
+
+    .section { fill: #fff; stroke: #cfd7df; stroke-width: 1.2; }
+    .clc { fill: #eef2f5; stroke: #657783; stroke-width: 1.4; }
+    .barrier { fill: #fff3f3; stroke: #ad4545; stroke-width: 1.5; }
+    .tma { fill: #fff4d8; stroke: #9c6b12; stroke-width: 1.5; }
+    .mma { fill: #eaf5ff; stroke: #2774a7; stroke-width: 1.6; }
+    .acc { fill: #f3edfb; stroke: #7253a3; stroke-width: 1.6; }
+    .epi-load { fill: #f2f2f2; stroke: #858585; stroke-width: 1.3; stroke-dasharray: 6 4; }
+    .epi { fill: #edf8f2; stroke: #3f7d5c; stroke-width: 1.5; }
+    .store { fill: #fff7db; stroke: #8a6c2d; stroke-width: 1.5; }
+    .note { fill: #f4f6f8; stroke: #aeb9c4; stroke-width: 1; }
+
+    .flow { stroke: #34495e; stroke-width: 2.1; fill: none; }
+    .complete { stroke: #25804a; stroke-width: 2.3; stroke-dasharray: 7 5; fill: none; }
+    .acc-flow { stroke: #7253a3; stroke-width: 2.3; fill: none; }
+    .store-flow { stroke: #8a6c2d; stroke-width: 2.2; fill: none; }
+    .meta-flow { stroke: #657783; stroke-width: 1.8; stroke-dasharray: 6 5; fill: none; }
+    .optional-flow { stroke: #858585; stroke-width: 1.8; stroke-dasharray: 6 5; fill: none; }
+  </style>
+
+  <defs>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#34495e"/></marker>
+    <marker id="arrowComplete" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#25804a"/></marker>
+    <marker id="arrowAcc" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#7253a3"/></marker>
+    <marker id="arrowStore" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a6c2d"/></marker>
+    <marker id="arrowMeta" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#657783"/></marker>
+    <marker id="arrowOptional" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#858585"/></marker>
+  </defs>
+
+  <!-- Header -->
+  <text x="32" y="42" class="title">Case12：SM100 2SM Conv2d 的五条 Pipeline</text>
+  <text x="32" y="70" class="sub">F16 A/B · FP32 accumulator · CTA tile 256×256×64 · cluster 2×1×1 · 3 个 K tile/work tile · 4 条 UMMA/K tile</text>
+  <text x="32" y="94" class="sub">只保留 pipeline API、关键 PTX 和依赖闭环；每行展开一个代表性 stage，横向表示逻辑先后，不表示真实 cycle 比例。</text>
+
+  <rect x="1610" y="20" width="850" height="72" rx="7" class="note"/>
+  <text x="1628" y="45" class="box-title">公共初始化（不单独算一条 pipeline）</text>
+  <text x="1628" y="69" class="mono">mbarrier.init; fence.mbarrier_init.release.cluster; tcgen05.alloc.cta_group::2</text>
+
+  <!-- Pipeline 1: CLC -->
+  <rect x="28" y="116" width="2444" height="205" rx="8" class="section"/>
+  <rect x="28" y="116" width="245" height="205" rx="8" fill="#eef2f5" stroke="#cfd7df"/>
+  <text x="46" y="150" class="section-title">1. CLC Pipeline</text>
+  <text x="46" y="175" class="section-sub">PipelineCLCFetchAsync&lt;1&gt;</text>
+  <text x="46" y="207" class="small">Producer：Scheduler warp</text>
+  <text x="46" y="228" class="small">Consumer：各参与角色</text>
+  <text x="46" y="260" class="tiny">传递 WorkTileInfo</text>
+  <text x="46" y="281" class="tiny">不是 tensor data path</text>
+
+  <rect x="300" y="143" width="410" height="135" rx="7" class="clc"/>
+  <circle cx="677" cy="168" r="15" fill="#657783"/><text x="673" y="173" class="step">1</text>
+  <text x="320" y="176" class="box-title">等待 EMPTYᶜᴸᶜ[S]，设置 transaction bytes</text>
+  <text x="320" y="207" class="mono">mbarrier.try_wait.parity ... [empty_clc[S]]</text>
+  <text x="320" y="232" class="mono">mbarrier.arrive.expect_tx ... [full_clc[S]], 16B</text>
+  <text x="320" y="258" class="tiny">producer_acquire 后取得 full barrier 地址</text>
+  <path d="M710,210 L755,210" class="flow" marker-end="url(#arrow)"/>
+
+  <rect x="770" y="133" width="675" height="155" rx="7" class="clc"/>
+  <circle cx="1412" cy="158" r="15" fill="#657783"/><text x="1408" y="163" class="step">2</text>
+  <text x="790" y="166" class="box-title">异步请求取消未启动 cluster，结果写入 SMEM</text>
+  <text x="790" y="198" class="mono">clusterlaunchcontrol.try_cancel.async.shared::cta</text>
+  <text x="790" y="218" class="mono">  .mbarrier::complete_tx::bytes.multicast::cluster::all.b128</text>
+  <text x="790" y="246" class="tiny">CLC response 到达后由 complete_tx 更新 FULLᶜᴸᶜ[S]</text>
+  <text x="790" y="268" class="tiny">response 是 16-byte 调度结果，不包含 A/B/C/D 数据</text>
+  <path d="M1445,210 L1490,210" class="complete" marker-end="url(#arrowComplete)"/>
+
+  <rect x="1505" y="133" width="905" height="155" rx="7" class="clc"/>
+  <circle cx="2377" cy="158" r="15" fill="#657783"/><text x="2373" y="163" class="step">3</text>
+  <text x="1525" y="166" class="box-title">等待 FULL → 解析 WorkTileInfo → 归还 EMPTYᶜᴸᶜ[S]</text>
+  <text x="1525" y="198" class="mono">mbarrier.try_wait.parity ... [full_clc[S]]</text>
+  <text x="1525" y="220" class="mono">ld.shared.b128; clusterlaunchcontrol.query_cancel.*</text>
+  <text x="1525" y="242" class="mono">mbarrier.arrive.shared::cluster ... [empty_clc[S]]</text>
+  <text x="1525" y="268" class="tiny">所有参与角色拿到相同 work tile；下一 tile 的 CLC fetch 可与当前计算重叠</text>
+
+  <path d="M2100,288 L2100,307 L500,307 L500,278" class="complete" marker-end="url(#arrowComplete)"/>
+  <text x="955" y="303" class="tiny" fill="#25804a">CLC stage 复用：consumer release → EMPTYᶜᴸᶜ → 下一次 fetch</text>
+
+  <!-- Pipeline 2: Mainloop -->
+  <rect x="28" y="337" width="2444" height="330" rx="8" class="section"/>
+  <rect x="28" y="337" width="245" height="330" rx="8" fill="#fff5df" stroke="#cfd7df"/>
+  <text x="46" y="371" class="section-title">2. Mainloop Pipeline</text>
+  <text x="46" y="396" class="section-sub">PipelineTmaUmmaAsync</text>
+  <text x="46" y="417" class="section-sub">代表 SMEM A/B stage S</text>
+  <text x="46" y="451" class="small">FULL：TMA 数据到齐</text>
+  <text x="46" y="474" class="small">EMPTY：UMMA 已读完</text>
+  <text x="46" y="512" class="tiny">每个 K tile 一轮</text>
+
+  <path d="M1955,288 L1955,327 L980,327 L980,365" class="meta-flow" marker-end="url(#arrowMeta)"/>
+  <text x="1120" y="322" class="tiny" fill="#657783">WorkTileInfo → A/B tensor coordinates</text>
+
+  <rect x="300" y="370" width="430" height="205" rx="7" class="barrier"/>
+  <circle cx="697" cy="395" r="15" fill="#ad4545"/><text x="693" y="400" class="step">1</text>
+  <text x="320" y="403" class="box-title">TMA producer：acquire + arm FULL</text>
+  <text x="320" y="434" class="mono">mbarrier.try_wait.parity ... [empty_ml[S]]</text>
+  <text x="320" y="461" class="mono">mbarrier.arrive.expect_tx ... [full_ml[S]],</text>
+  <text x="320" y="481" class="mono">  TmaTransactionBytes = 2 × (A_stage + B_stage)</text>
+  <text x="320" y="511" class="tiny">EMPTY ready 才能覆盖 SMEM；2SM leader 设置预期字节</text>
+  <text x="320" y="535" class="tiny">producer_get_barrier()/with() 只传 barrier 地址，不发 PTX</text>
+  <path d="M730,472 L770,472" class="flow" marker-end="url(#arrow)"/>
+
+  <rect x="785" y="360" width="530" height="225" rx="7" class="tma"/>
+  <circle cx="1282" cy="385" r="15" fill="#9c6b12"/><text x="1278" y="390" class="step">2</text>
+  <text x="805" y="393" class="box-title">A/B TMA：GMEM → 两个 CTA 的 SMEM[S]</text>
+  <text x="805" y="426" class="body">A / activation：</text>
+  <text x="805" y="448" class="mono">cp.async.bulk.tensor.5d.im2col.cta_group::2...</text>
+  <text x="805" y="468" class="mono">  .mbarrier::complete_tx::bytes.multicast::cluster</text>
+  <text x="805" y="499" class="body">B / filter：</text>
+  <text x="805" y="521" class="mono">cp.async.bulk.tensor.5d.cta_group::2...</text>
+  <text x="805" y="541" class="mono">  .mbarrier::complete_tx::bytes.multicast::cluster</text>
+  <text x="805" y="568" class="tiny">TMA engine 完成 A+B byte debt 后，FULLᴹᴸ[S] ready</text>
+  <path d="M1315,472 L1355,472" class="complete" marker-end="url(#arrowComplete)"/>
+
+  <rect x="1370" y="390" width="300" height="165" rx="7" class="barrier"/>
+  <circle cx="1637" cy="415" r="15" fill="#ad4545"/><text x="1633" y="420" class="step">3</text>
+  <text x="1390" y="423" class="box-title">MMA consumer 等待 FULLᴹᴸ[S]</text>
+  <text x="1390" y="456" class="mono">mbarrier.try_wait.parity</text>
+  <text x="1390" y="476" class="mono">  ... [full_ml[S]], phase</text>
+  <text x="1390" y="508" class="tiny">通过后 A/B SMEM descriptor 才能交给 UMMA</text>
+  <text x="1390" y="533" class="tiny">TMA complete_tx 没有单独的线程侧指令</text>
+  <path d="M1670,472 L1710,472" class="flow" marker-end="url(#arrow)"/>
+
+  <rect x="1725" y="360" width="685" height="225" rx="7" class="mma"/>
+  <circle cx="2377" cy="385" r="15" fill="#2774a7"/><text x="2373" y="390" class="step">4</text>
+  <text x="1745" y="393" class="box-title">UMMA 读 SMEM、写 TMEM；完成后归还 EMPTYᴹᴸ[S]</text>
+  <text x="1745" y="428" class="mono">tcgen05.mma.cta_group::2.kind::f16 ... ×4 / K tile</text>
+  <line x1="1745" y1="450" x2="2385" y2="450" stroke="#b6d3e8"/>
+  <text x="1745" y="480" class="mono">tcgen05.commit.cta_group::2.mbarrier::arrive::one</text>
+  <text x="1745" y="500" class="mono">  .shared::cluster.multicast::cluster [empty_ml[S]], mask</text>
+  <text x="1745" y="532" class="tiny">commit 不阻塞；UMMA 真正不再读 SMEM 后，EMPTY 才 arrive</text>
+  <text x="1745" y="557" class="tiny">目标是 mainloop EMPTY，不是 accumulator FULL</text>
+
+  <path d="M2065,585 L2065,630 L505,630 L505,575" class="complete" marker-end="url(#arrowComplete)"/>
+  <text x="920" y="622" class="small" fill="#25804a">SMEM 复用闭环：UMMA completion → EMPTYᴹᴸ[S] → 下一轮 TMA acquire</text>
+
+  <!-- Pipeline 3: Accumulator -->
+  <rect x="28" y="683" width="2444" height="310" rx="8" class="section"/>
+  <rect x="28" y="683" width="245" height="310" rx="8" fill="#f3edfb" stroke="#cfd7df"/>
+  <text x="46" y="717" class="section-title">3. Accumulator Pipeline</text>
+  <text x="46" y="742" class="section-sub">PipelineUmmaAsync&lt;2&gt;</text>
+  <text x="46" y="763" class="section-sub">代表 TMEM stage J</text>
+  <text x="46" y="797" class="small">FULL：UMMA 已写完</text>
+  <text x="46" y="820" class="small">EMPTY：TMEM load 已读完</text>
+  <text x="46" y="858" class="tiny">每个 work tile 一轮</text>
+
+  <path d="M2070,585 L2070,673 L985,673 L985,713" class="acc-flow" marker-end="url(#arrowAcc)"/>
+  <text x="1170" y="668" class="tiny" fill="#7253a3">同一批 UMMA 将 FP32 partial sums 写入 TMEM[J]</text>
+
+  <rect x="300" y="713" width="355" height="190" rx="7" class="acc"/>
+  <circle cx="622" cy="738" r="15" fill="#7253a3"/><text x="618" y="743" class="step">1</text>
+  <text x="320" y="746" class="box-title">producer_acquire：等待 EMPTYᴬᶜᶜ[J]</text>
+  <text x="320" y="779" class="mono">mbarrier.try_wait.parity</text>
+  <text x="320" y="799" class="mono">  ... [empty_acc[J]], phase</text>
+  <text x="320" y="831" class="tiny">上一 work tile 的 epilogue 读完 TMEM 后才可覆盖</text>
+  <text x="320" y="856" class="tiny">一次 acquire 覆盖整个 K-loop</text>
+  <path d="M655,808 L695,808" class="acc-flow" marker-end="url(#arrowAcc)"/>
+
+  <rect x="710" y="713" width="510" height="190" rx="7" class="acc"/>
+  <text x="730" y="746" class="box-title">TMEM[J] 跨 K-loop 累加</text>
+  <rect x="735" y="778" width="130" height="52" rx="5" fill="#e5d8f5" stroke="#7253a3"/>
+  <text x="768" y="801" class="body">K tile 0</text><text x="758" y="820" class="tiny">UMMA ×4</text>
+  <path d="M865,804 L900,804" class="acc-flow" marker-end="url(#arrowAcc)"/>
+  <rect x="915" y="778" width="130" height="52" rx="5" fill="#eadff6" stroke="#7253a3"/>
+  <text x="948" y="801" class="body">K tile 1</text><text x="938" y="820" class="tiny">UMMA ×4</text>
+  <path d="M1045,804 L1080,804" class="acc-flow" marker-end="url(#arrowAcc)"/>
+  <rect x="1095" y="778" width="100" height="52" rx="5" fill="#efe8f8" stroke="#7253a3"/>
+  <text x="1117" y="801" class="body">K tile 2</text><text x="1103" y="820" class="tiny">UMMA ×4</text>
+  <text x="730" y="861" class="tiny">Mainloop 每 K tile 归还 SMEM；TMEM 保留全部 K tile 的累加结果</text>
+  <path d="M1220,808 L1260,808" class="acc-flow" marker-end="url(#arrowAcc)"/>
+
+  <rect x="1275" y="703" width="520" height="210" rx="7" class="acc"/>
+  <circle cx="1762" cy="728" r="15" fill="#7253a3"/><text x="1758" y="733" class="step">2</text>
+  <text x="1295" y="736" class="box-title">K-loop 后 producer_commit → FULLᴬᶜᶜ[J]</text>
+  <text x="1295" y="770" class="mono">tcgen05.commit.cta_group::2.mbarrier::arrive::one</text>
+  <text x="1295" y="790" class="mono">  .shared::cluster.multicast::cluster [full_acc[J]], mask</text>
+  <text x="1295" y="824" class="tiny">此前 3×4 条 UMMA 真正完成后，FULL 才 ready</text>
+  <line x1="1295" y1="844" x2="1770" y2="844" stroke="#cdbbe1"/>
+  <text x="1295" y="869" class="tiny">与 mainloop consumer_release 使用同一 PTX family，</text>
+  <text x="1295" y="891" class="tiny">但这里的目标是 accumulator FULL。</text>
+  <path d="M1795,808 L1835,808" class="complete" marker-end="url(#arrowComplete)"/>
+
+  <rect x="1850" y="703" width="560" height="210" rx="7" class="epi"/>
+  <circle cx="2377" cy="728" r="15" fill="#3f7d5c"/><text x="2373" y="733" class="step">3</text>
+  <text x="1870" y="736" class="box-title">Epilogue：等待 FULL → TMEM→register → release</text>
+  <text x="1870" y="768" class="mono">mbarrier.try_wait.parity ... [full_acc[J]]</text>
+  <text x="1870" y="796" class="mono">tcgen05.ld.sync.aligned.32x32b.x32.b32</text>
+  <text x="1870" y="824" class="mono">tcgen05.wait::ld.sync.aligned</text>
+  <text x="1870" y="852" class="mono">mbarrier.arrive.shared::cluster ... [empty_acc[J]]</text>
+  <text x="1870" y="882" class="tiny">wait::ld 保证寄存器已取到结果；之后普通 arrive 归还 TMEM stage</text>
+
+  <path d="M2125,913 L2125,960 L477,960 L477,903" class="acc-flow" stroke-dasharray="7 5" marker-end="url(#arrowAcc)"/>
+  <text x="910" y="953" class="small" fill="#7253a3">TMEM 复用闭环：tcgen05.wait::ld → EMPTYᴬᶜᶜ[J] → 下一 work tile acquire</text>
+
+  <!-- Pipeline 4: Epilogue load -->
+  <rect x="28" y="1009" width="2444" height="205" rx="8" class="section"/>
+  <rect x="28" y="1009" width="245" height="205" rx="8" fill="#f2f2f2" stroke="#cfd7df"/>
+  <text x="46" y="1043" class="section-title">4. Epilogue Load Pipeline</text>
+  <text x="46" y="1068" class="section-sub">PipelineTransactionAsync</text>
+  <text x="46" y="1101" class="small">GMEM C/aux → SMEM</text>
+  <text x="46" y="1136" class="tiny">当前 kernel：C = void</text>
+  <text x="46" y="1157" class="tiny">因此整行运行时跳过</text>
+
+  <rect x="300" y="1036" width="440" height="135" rx="7" class="epi-load"/>
+  <text x="320" y="1066" class="box-title" fill="#666">producer acquire + arm FULLᴱᴾᴵ[S]</text>
+  <text x="320" y="1097" class="mono" fill="#666">mbarrier.try_wait ... [empty_epi[S]]</text>
+  <text x="320" y="1122" class="mono" fill="#666">mbarrier.arrive.expect_tx ... [full_epi[S]], bytes</text>
+  <text x="320" y="1149" class="tiny" fill="#777">仅当 fusion callback 需要 source C/aux 时执行</text>
+  <path d="M740,1103 L780,1103" class="optional-flow" marker-end="url(#arrowOptional)"/>
+
+  <rect x="795" y="1036" width="485" height="135" rx="7" class="epi-load"/>
+  <text x="815" y="1066" class="box-title" fill="#666">TMA load：GMEM C/aux → SMEM[S]</text>
+  <text x="815" y="1097" class="mono" fill="#666">cp.async.bulk.tensor...shared::cluster.global</text>
+  <text x="815" y="1117" class="mono" fill="#666">  .mbarrier::complete_tx::bytes</text>
+  <text x="815" y="1149" class="tiny" fill="#777">TMA 完成 transaction bytes 后，FULLᴱᴾᴵ[S] ready</text>
+  <path d="M1280,1103 L1320,1103" class="optional-flow" marker-end="url(#arrowOptional)"/>
+
+  <rect x="1335" y="1036" width="650" height="135" rx="7" class="epi-load"/>
+  <text x="1355" y="1066" class="box-title" fill="#666">consumer wait → SMEM→register → release EMPTYᴱᴾᴵ[S]</text>
+  <text x="1355" y="1097" class="mono" fill="#666">mbarrier.try_wait ... [full_epi[S]]; ld.shared ...</text>
+  <text x="1355" y="1122" class="mono" fill="#666">mbarrier.arrive.shared::cluster ... [empty_epi[S]]</text>
+  <text x="1355" y="1149" class="tiny" fill="#777">读出的 C/aux 寄存器片段交给下方 visitor；release 后 stage 可复用</text>
+
+  <rect x="2035" y="1036" width="375" height="135" rx="7" class="note"/>
+  <text x="2055" y="1066" class="box-title">与 accumulator 的汇合点</text>
+  <text x="2055" y="1097" class="body">Accumulator registers</text>
+  <text x="2055" y="1121" class="body">+ 可选 C/aux registers</text>
+  <text x="2055" y="1148" class="tiny">→ fusion visitor → output D</text>
+  <path d="M1985,1103 L2020,1103" class="optional-flow" marker-end="url(#arrowOptional)"/>
+
+  <path d="M2125,913 L2125,1026" class="acc-flow" marker-end="url(#arrowAcc)"/>
+  <text x="2140" y="986" class="tiny" fill="#7253a3">Accumulator registers</text>
+
+  <!-- Pipeline 5: Epilogue store -->
+  <rect x="28" y="1230" width="2444" height="225" rx="8" class="section"/>
+  <rect x="28" y="1230" width="245" height="225" rx="8" fill="#fff7db" stroke="#cfd7df"/>
+  <text x="46" y="1264" class="section-title">5. Epilogue Store Pipeline</text>
+  <text x="46" y="1289" class="section-sub">PipelineTmaStore</text>
+  <text x="46" y="1322" class="small">register → SMEM D → GMEM D</text>
+  <text x="46" y="1357" class="tiny">无 full/empty mbarrier 对</text>
+  <text x="46" y="1378" class="tiny">由 bulk-group scoreboard 复用</text>
+
+  <path d="M2220,1171 L2220,1219 L485,1219 L485,1255" class="flow" marker-end="url(#arrow)"/>
+
+  <rect x="300" y="1255" width="405" height="150" rx="7" class="epi"/>
+  <text x="320" y="1287" class="box-title">fusion visitor → SMEM D</text>
+  <text x="320" y="1318" class="body">alpha / ReLU / FP16 pack → STS</text>
+  <text x="320" y="1347" class="mono">fence.proxy.async.shared::cta</text>
+  <text x="320" y="1375" class="tiny">proxy fence 保证 TMA engine 能观察到 SMEM 写入</text>
+  <path d="M705,1330 L745,1330" class="store-flow" marker-end="url(#arrowStore)"/>
+
+  <rect x="760" y="1255" width="485" height="150" rx="7" class="store"/>
+  <text x="780" y="1287" class="box-title">TMA store：SMEM D → GMEM D</text>
+  <text x="780" y="1318" class="mono">cp.async.bulk.tensor.5d.global.shared::cta</text>
+  <text x="780" y="1338" class="mono">  .im2col_no_offs.bulk_group ...</text>
+  <text x="780" y="1373" class="tiny">异步发出；SMEM D slot 尚不能立刻覆盖</text>
+  <path d="M1245,1330 L1285,1330" class="store-flow" marker-end="url(#arrowStore)"/>
+
+  <rect x="1300" y="1255" width="390" height="150" rx="7" class="store"/>
+  <text x="1320" y="1287" class="box-title">producer_commit</text>
+  <text x="1320" y="1318" class="mono">cp.async.bulk.commit_group</text>
+  <text x="1320" y="1347" class="tiny">提交当前 TMA store batch</text>
+  <text x="1320" y="1373" class="tiny">不是 tcgen05.commit，也不操作 mbarrier</text>
+  <path d="M1690,1330 L1730,1330" class="store-flow" marker-end="url(#arrowStore)"/>
+
+  <rect x="1745" y="1255" width="665" height="150" rx="7" class="store"/>
+  <text x="1765" y="1287" class="box-title">下一次 producer_acquire：等待最老 batch，复用 SMEM D</text>
+  <text x="1765" y="1318" class="mono">cp.async.bulk.wait_group.read 1</text>
+  <text x="1765" y="1347" class="tiny">in-flight store 数降到阈值后，才允许覆盖最老的 SMEM D slot</text>
+  <text x="1765" y="1373" class="tiny">producer_tail 使用 wait_group 0，等待全部 TMA store 完成</text>
+
+  <!-- Summary -->
+  <rect x="28" y="1472" width="2444" height="58" rx="8" class="note"/>
+  <text x="48" y="1507" class="body">CLC 管 work tile 元数据；Mainloop 管 SMEM A/B；Accumulator 管 TMEM partial sums；Epilogue Load 管可选 C/aux SMEM；Epilogue Store 管输出 SMEM D 与 GMEM 写回。</text>
+</svg>
